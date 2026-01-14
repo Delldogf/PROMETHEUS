@@ -1,0 +1,33 @@
+# PROMETHEUS Dependencies
+# Proof-Reasoning and Olympiad Mathematical Engine
+
+# Core
+python-dotenv>=1.0.0          # Environment variable management
+
+# LLM Integration
+openai>=1.0.0                  # OpenAI API (or compatible)
+anthropic>=0.18.0              # Anthropic Claude API
+transformers>=4.36.0           # For local models
+torch>=2.0.0                   # PyTorch for neural components
+
+# Symbolic Math
+sympy>=1.12                    # Symbolic mathematics
+z3-solver>=4.12.0              # SMT solver for logical reasoning
+numpy>=1.24.0                  # Numerical operations
+
+# Search & Optimization
+scipy>=1.11.0                  # Scientific computing
+
+# Data & Utilities
+pydantic>=2.0.0                # Data validation and settings
+typing-extensions>=4.8.0       # Extended typing support
+rich>=13.0.0                   # Beautiful terminal output
+tqdm>=4.66.0                   # Progress bars
+
+# Testing
+pytest>=7.4.0                  # Testing framework
+pytest-asyncio>=0.21.0         # Async test support
+
+# Development
+black>=23.0.0                  # Code formatting
+mypy>=1.5.0                    # Type checking
