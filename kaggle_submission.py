@@ -8,18 +8,35 @@ This notebook combines:
 
 The LLM uses PROMETHEUS tools to solve olympiad problems with verified answers.
 
-AIMO 3 Answer Format: Integer from 0 to 99999 (5 digits)
+COMPETITION REQUIREMENTS (AIMO 3):
+- Answer Format: Integer from 0 to 99999 (5 digits)
+- GPU Notebook: <= 5 hours runtime
+- CPU Notebook: <= 9 hours runtime
+- Internet: DISABLED (offline only)
+- Must call serve() within 15 minutes of script start
+- Model loading should happen INSIDE predict() (lazy loading)
 
-IMPORTANT vLLM Notes:
+VLLM COMPATIBILITY NOTES:
 - Use vLLM >= 0.10.2 for tool calling support
-- GPT-OSS may have issues with vLLM V1 engine, set VLLM_USE_V1=0 if unstable
-- For H100: works great with --async-scheduling flag
+- GPT-OSS may have issues with vLLM V1 engine
+- Set VLLM_USE_V1=0 if experiencing instability
+- For H100: use --async-scheduling flag for better performance
+
+DIAGNOSTICS:
+- All major operations are logged with timestamps
+- GPU/CPU memory usage is tracked
+- Problem-level timing and answers are logged
+- Tool call execution is logged
 """
 
 import os
 import re
 import json
 import math
+import time
+import traceback
+import gc
+from datetime import datetime
 from typing import List, Dict, Any, Optional, Callable
 from dataclasses import dataclass, field
 from functools import lru_cache
@@ -28,20 +45,170 @@ import torch
 import polars as pl
 import pandas as pd
 
-# vLLM Compatibility Note:
-# GPT-OSS works best with vLLM 0.10.2 for tool calling
-# If you experience instability, set: os.environ["VLLM_USE_V1"] = "0"
-# This disables the V1 engine which can have issues with GPT-OSS
+# ============================================================
+# DIAGNOSTICS AND LOGGING SYSTEM
+# ============================================================
+
+class DiagnosticLogger:
+    """
+    Comprehensive logging for AIMO 3 competition.
+    Since we can't access internet, all diagnostics go to stdout.
+    """
+    
+    def __init__(self, verbose: bool = True):
+        self.verbose = verbose
+        self.start_time = time.time()
+        self.problem_count = 0
+        self.total_problems = 0
+        self.correct_count = 0  # For local testing
+        self.timings: List[float] = []
+        
+    def log(self, message: str, level: str = "INFO"):
+        """Log a message with timestamp and level."""
+        elapsed = time.time() - self.start_time
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        prefix = f"[{timestamp}][{elapsed:7.1f}s][{level:5s}]"
+        print(f"{prefix} {message}")
+        
+    def log_system_info(self):
+        """Log system information at startup."""
+        self.log("=" * 60, "INFO")
+        self.log("PROMETHEUS + GPT-OSS-120B for AIMO 3", "INFO")
+        self.log("=" * 60, "INFO")
+        
+        # Python and environment
+        import sys
+        self.log(f"Python: {sys.version.split()[0]}", "INFO")
+        self.log(f"Platform: {sys.platform}", "INFO")
+        
+        # Check if running in competition mode
+        is_competition = os.getenv('KAGGLE_IS_COMPETITION_RERUN')
+        self.log(f"Competition mode: {bool(is_competition)}", "INFO")
+        
+        # GPU information
+        if torch.cuda.is_available():
+            gpu_count = torch.cuda.device_count()
+            self.log(f"GPUs available: {gpu_count}", "INFO")
+            for i in range(gpu_count):
+                gpu_name = torch.cuda.get_device_name(i)
+                gpu_mem = torch.cuda.get_device_properties(i).total_memory / 1e9
+                self.log(f"  GPU {i}: {gpu_name} ({gpu_mem:.1f} GB)", "INFO")
+        else:
+            self.log("No GPU available - using CPU", "WARN")
+            
+        # Check vLLM availability
+        self.log(f"vLLM backend: {USE_VLLM}", "INFO")
+        
+        self.log("=" * 60, "INFO")
+        
+    def log_memory(self, label: str = ""):
+        """Log current memory usage."""
+        if not self.verbose:
+            return
+            
+        prefix = f"[Memory{': ' + label if label else ''}]"
+        
+        # CPU memory
+        try:
+            import psutil
+            process = psutil.Process()
+            cpu_mem = process.memory_info().rss / 1e9
+            self.log(f"{prefix} CPU RAM: {cpu_mem:.2f} GB", "DEBUG")
+        except ImportError:
+            pass
+            
+        # GPU memory
+        if torch.cuda.is_available():
+            for i in range(torch.cuda.device_count()):
+                allocated = torch.cuda.memory_allocated(i) / 1e9
+                reserved = torch.cuda.memory_reserved(i) / 1e9
+                self.log(f"{prefix} GPU {i}: {allocated:.2f} GB allocated, {reserved:.2f} GB reserved", "DEBUG")
+                
+    def log_problem_start(self, problem_id: Any, problem_text: str):
+        """Log when starting a new problem."""
+        self.problem_count += 1
+        self.log("-" * 40, "INFO")
+        self.log(f"Problem {self.problem_count}: ID={problem_id}", "INFO")
+        
+        # Show first 200 chars of problem
+        preview = problem_text[:200].replace('\n', ' ')
+        if len(problem_text) > 200:
+            preview += "..."
+        self.log(f"Text: {preview}", "INFO")
+        
+    def log_problem_end(self, problem_id: Any, answer: int, duration: float):
+        """Log when finishing a problem."""
+        self.timings.append(duration)
+        avg_time = sum(self.timings) / len(self.timings)
+        
+        self.log(f"Answer: {answer} (took {duration:.2f}s, avg: {avg_time:.2f}s)", "INFO")
+        self.log_memory("after problem")
+        
+    def log_tool_call(self, tool_name: str, args: Dict, result: Any):
+        """Log a tool call execution."""
+        if self.verbose:
+            args_str = json.dumps(args)[:100]
+            result_str = str(result)[:100]
+            self.log(f"Tool: {tool_name}({args_str}) -> {result_str}", "DEBUG")
+            
+    def log_error(self, error: Exception, context: str = ""):
+        """Log an error with traceback."""
+        self.log(f"ERROR in {context}: {str(error)}", "ERROR")
+        self.log(traceback.format_exc(), "ERROR")
+        
+    def log_summary(self):
+        """Log final summary statistics."""
+        self.log("=" * 60, "INFO")
+        self.log("FINAL SUMMARY", "INFO")
+        self.log("=" * 60, "INFO")
+        
+        total_time = time.time() - self.start_time
+        self.log(f"Total problems processed: {self.problem_count}", "INFO")
+        self.log(f"Total runtime: {total_time:.1f}s ({total_time/60:.1f} min)", "INFO")
+        
+        if self.timings:
+            avg_time = sum(self.timings) / len(self.timings)
+            max_time = max(self.timings)
+            min_time = min(self.timings)
+            self.log(f"Time per problem: avg={avg_time:.1f}s, min={min_time:.1f}s, max={max_time:.1f}s", "INFO")
+            
+        # Estimate remaining time for 50 problems
+        if self.timings:
+            remaining = 50 - self.problem_count
+            estimated = remaining * avg_time
+            self.log(f"Estimated time for {remaining} more problems: {estimated/60:.1f} min", "INFO")
+            
+        self.log_memory("final")
+        self.log("=" * 60, "INFO")
+
+
+# Global logger instance
+LOGGER = DiagnosticLogger(verbose=True)
+
+
+# ============================================================
+# VLLM STABILITY SETTINGS FOR GPT-OSS
+# ============================================================
+
+# Set V1 engine off for GPT-OSS stability (if experiencing issues)
+# Uncomment the line below if you experience hangs or garbled output
+# os.environ["VLLM_USE_V1"] = "0"
 
 # Try vLLM first (preferred for tool calling), fallback to Transformers
 try:
     from vllm import LLM
     from vllm.sampling_params import SamplingParams
     USE_VLLM = True
-except ImportError:
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    LOGGER.log("vLLM imported successfully", "INFO")
+except ImportError as e:
     USE_VLLM = False
-    print("vLLM not available, using Transformers (tool calling may be limited)")
+    LOGGER.log(f"vLLM not available: {e}", "WARN")
+    LOGGER.log("Falling back to Transformers (tool calling may be limited)", "WARN")
+    try:
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+        LOGGER.log("Transformers imported successfully", "INFO")
+    except ImportError as e2:
+        LOGGER.log(f"Transformers also not available: {e2}", "ERROR")
 
 # ============================================================
 # PROMETHEUS MATH TOOLS (Verified Computations)
@@ -557,15 +724,23 @@ TOOL_MAP = {
 
 
 def execute_tool(name: str, arguments: Dict[str, Any]) -> str:
-    """Execute a tool and return the result as a string."""
+    """Execute a PROMETHEUS tool and return the result as a string."""
     if name not in TOOL_MAP:
-        return json.dumps({"error": f"Unknown tool: {name}"})
+        error_result = {"error": f"Unknown tool: {name}"}
+        LOGGER.log(f"Tool call FAILED: {name} - unknown tool", "WARN")
+        return json.dumps(error_result)
     
     try:
         result = TOOL_MAP[name](**arguments)
+        
+        # Log successful tool call
+        LOGGER.log_tool_call(name, arguments, result)
+        
         return json.dumps(result)
     except Exception as e:
-        return json.dumps({"error": str(e)})
+        error_result = {"error": str(e)}
+        LOGGER.log(f"Tool call FAILED: {name}({arguments}) - {e}", "ERROR")
+        return json.dumps(error_result)
 
 
 # ============================================================
@@ -580,42 +755,72 @@ class PrometheusSolver:
     - vLLM (preferred): Native tool calling via llm.chat(..., tools=TOOLS)
     - Transformers (fallback): Manual tool call extraction
     
-    For vLLM stability with GPT-OSS, you may need to:
-    - Use vLLM 0.10.2
-    - Set VLLM_USE_V1=0 if experiencing issues
+    GPT-OSS COMPATIBILITY NOTES:
+    - Use vLLM 0.10.2 for best stability
+    - Set VLLM_USE_V1=0 if experiencing hangs or garbled output
+    - For H100: enable --async-scheduling for better performance
+    - Model loads from local path (offline compatible)
     """
     
     def __init__(self, model_path: str = "/kaggle/input/gpt-oss-120b/transformers/default/1"):
-        print("Loading GPT-OSS-120B...")
-        print(f"Using backend: {'vLLM' if USE_VLLM else 'Transformers'}")
+        LOGGER.log(f"Initializing PrometheusSolver with model: {model_path}", "INFO")
+        LOGGER.log(f"Backend: {'vLLM' if USE_VLLM else 'Transformers'}", "INFO")
         
         self.model_path = model_path
         
+        # Verify model path exists (offline check)
+        if os.path.exists(model_path):
+            LOGGER.log(f"Model path verified: {model_path}", "INFO")
+        else:
+            LOGGER.log(f"WARNING: Model path not found: {model_path}", "WARN")
+            LOGGER.log("This is expected if not running in Kaggle environment", "WARN")
+        
         if USE_VLLM:
+            LOGGER.log("Initializing vLLM backend...", "INFO")
+            
             # vLLM backend - native tool calling support
+            # GPT-OSS recommended settings for H100
             self.llm = LLM(
                 model=model_path,
                 trust_remote_code=True,
                 dtype="float16",
-                # Recommended settings for GPT-OSS stability
+                # GPT-OSS optimized settings
                 max_model_len=32768,
+                # Uncomment for H100 with multiple GPUs:
+                # tensor_parallel_size=1,
+                # For stability issues, you can also try:
+                # gpu_memory_utilization=0.85,
             )
+            
             self.sampling_params = SamplingParams(
                 max_tokens=4096,
                 temperature=0.3,
+                # For more deterministic outputs:
+                # top_p=0.95,
             )
+            
+            LOGGER.log("vLLM backend initialized", "INFO")
+            
         else:
+            LOGGER.log("Initializing Transformers backend...", "INFO")
+            
             # Transformers backend - manual tool handling
             from transformers import AutoModelForCausalLM, AutoTokenizer
-            self.tokenizer = AutoTokenizer.from_pretrained(model_path)
+            
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                model_path,
+                trust_remote_code=True
+            )
             self.model = AutoModelForCausalLM.from_pretrained(
                 model_path,
                 torch_dtype=torch.float16,
                 device_map="auto",
                 trust_remote_code=True
             )
+            
+            LOGGER.log("Transformers backend initialized", "INFO")
         
-        print("Model loaded successfully!")
+        LOGGER.log("Model loaded successfully!", "INFO")
         
         self.system_prompt = """You are PROMETHEUS, an expert mathematical olympiad solver.
 
@@ -820,76 +1025,189 @@ IMPORTANT: The final answer must be a 5-digit integer between 0 and 99999."""
 
 
 # ============================================================
-# KAGGLE SUBMISSION INTERFACE
+# KAGGLE SUBMISSION INTERFACE (AIMO 3 API)
 # ============================================================
 
-# Global solver instance (loaded once)
-_solver = None
+class ModelWrapper:
+    """
+    Wrapper for lazy model loading.
+    
+    IMPORTANT: In AIMO 3, you MUST call serve() within 15 minutes of script start.
+    Model loading should happen INSIDE predict(), which has no time limit.
+    This wrapper implements lazy loading - the model is only loaded on first use.
+    """
+    
+    def __init__(self, model_path: str = "/kaggle/input/gpt-oss-120b/transformers/default/1"):
+        self.model_path = model_path
+        self._solver = None
+        self._load_attempted = False
+        
+    def load(self):
+        """Load the model (called lazily on first predict)."""
+        if self._solver is not None:
+            return self._solver
+            
+        if self._load_attempted:
+            LOGGER.log("Model loading already attempted and failed", "WARN")
+            return None
+            
+        self._load_attempted = True
+        LOGGER.log("Starting model loading (this may take a few minutes)...", "INFO")
+        LOGGER.log_memory("before model load")
+        
+        load_start = time.time()
+        
+        try:
+            self._solver = PrometheusSolver(model_path=self.model_path)
+            load_time = time.time() - load_start
+            LOGGER.log(f"Model loaded successfully in {load_time:.1f}s", "INFO")
+            LOGGER.log_memory("after model load")
+            
+            # Force garbage collection to free any temporary memory
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                
+        except Exception as e:
+            LOGGER.log_error(e, "model loading")
+            self._solver = None
+            
+        return self._solver
+    
+    def predict(self, problem: str) -> int:
+        """Make a prediction (loads model on first call)."""
+        solver = self.load()
+        
+        if solver is None:
+            LOGGER.log("No solver available, returning 0", "ERROR")
+            return 0
+            
+        return solver.solve(problem)
 
-def get_solver():
-    """Get or create the global solver instance."""
-    global _solver
-    if _solver is None:
-        _solver = PrometheusSolver()
-    return _solver
+
+# Global model wrapper (lazy loading)
+_model = ModelWrapper()
 
 
-def predict(id_: pl.DataFrame, question: pl.DataFrame) -> pl.DataFrame:
+def predict(id_: pl.Series, question: pl.Series) -> pl.DataFrame | pd.DataFrame:
     """
     Make a prediction for the AIMO 3 competition.
     
+    IMPORTANT API NOTES:
+    - id_: pl.Series containing the problem ID
+    - question: pl.Series containing the problem text
+    - Returns: DataFrame with 'id' and 'answer' columns
+    - Answer must be integer from 0 to 99999
+    
     This function is called by the Kaggle evaluation server.
-    AIMO 3 answers must be integers from 0 to 99999.
+    Model loading happens lazily on first call (no time limit).
     """
-    # Unpack values
+    problem_start = time.time()
+    
+    # Unpack values from Series (not DataFrame!)
     problem_id = id_.item(0)
-    problem_text = question.item(0)
+    problem_text: str = question.item(0)
     
-    print(f"\n{'='*60}")
-    print(f"Problem {problem_id}")
-    print(f"{'='*60}")
-    print(problem_text[:200] + "..." if len(problem_text) > 200 else problem_text)
-    
-    # Get solver and solve
-    solver = get_solver()
+    # Log problem start
+    LOGGER.log_problem_start(problem_id, problem_text)
     
     try:
-        answer = solver.solve(problem_text)
-        print(f"\nAnswer: {answer}")
+        # Make prediction (model loads lazily on first call)
+        answer = _model.predict(problem_text)
+        
+        # Ensure answer is in valid AIMO 3 range (0-99999)
+        answer = max(0, min(99999, int(answer)))
+        
     except Exception as e:
-        print(f"\nError: {e}")
+        LOGGER.log_error(e, "prediction")
         answer = 0
     
-    # Ensure answer is in valid AIMO 3 range (0-99999)
-    answer = max(0, min(99999, answer))
+    # Log problem end
+    duration = time.time() - problem_start
+    LOGGER.log_problem_end(problem_id, answer, duration)
     
     return pl.DataFrame({'id': problem_id, 'answer': answer})
 
 
 # ============================================================
-# MAIN
+# MAIN ENTRY POINT
 # ============================================================
 
 if __name__ == "__main__":
-    # AIMO 3 Competition - Try to import the correct inference server
-    # The module name may be aimo_3_inference_server or still aimo_2_inference_server
+    # Log system information at startup
+    LOGGER.log_system_info()
+    
+    # ========================================
+    # AIMO 3 Competition Setup
+    # ========================================
+    
+    # Import the AIMO 3 inference server
+    LOGGER.log("Importing Kaggle evaluation server...", "INFO")
+    
     try:
         import kaggle_evaluation.aimo_3_inference_server as aimo_server
         InferenceServer = aimo_server.AIMO3InferenceServer
         test_csv_path = '/kaggle/input/ai-mathematical-olympiad-progress-prize-3/test.csv'
-    except ImportError:
-        # Fallback to AIMO 2 module if AIMO 3 not available
-        import kaggle_evaluation.aimo_2_inference_server as aimo_server
-        InferenceServer = aimo_server.AIMO2InferenceServer
-        test_csv_path = '/kaggle/input/ai-mathematical-olympiad-progress-prize-2/test.csv'
+        LOGGER.log("Using AIMO 3 inference server", "INFO")
+    except ImportError as e:
+        LOGGER.log(f"AIMO 3 server not found: {e}", "WARN")
+        LOGGER.log("Falling back to AIMO 2 server...", "WARN")
+        try:
+            import kaggle_evaluation.aimo_2_inference_server as aimo_server
+            InferenceServer = aimo_server.AIMO2InferenceServer
+            test_csv_path = '/kaggle/input/ai-mathematical-olympiad-progress-prize-2/test.csv'
+            LOGGER.log("Using AIMO 2 inference server (fallback)", "INFO")
+        except ImportError as e2:
+            LOGGER.log_error(e2, "importing evaluation server")
+            raise RuntimeError("Could not import any AIMO evaluation server")
     
     # Create inference server
+    LOGGER.log("Creating inference server...", "INFO")
     inference_server = InferenceServer(predict)
     
-    # Run in appropriate mode
-    if os.getenv('KAGGLE_IS_COMPETITION_RERUN'):
-        # Competition mode
+    # ========================================
+    # Run Mode Selection
+    # ========================================
+    
+    is_competition = os.getenv('KAGGLE_IS_COMPETITION_RERUN')
+    
+    if is_competition:
+        # =====================================
+        # COMPETITION MODE
+        # =====================================
+        LOGGER.log("=" * 60, "INFO")
+        LOGGER.log("RUNNING IN COMPETITION MODE", "INFO")
+        LOGGER.log("=" * 60, "INFO")
+        LOGGER.log("IMPORTANT: serve() must be called within 15 minutes!", "WARN")
+        LOGGER.log("Model will load lazily on first predict() call", "INFO")
+        
+        # Start serving (this blocks until all problems are processed)
         inference_server.serve()
+        
+        # Log final summary
+        LOGGER.log_summary()
+        
     else:
-        # Local testing mode
-        inference_server.run_local_gateway((test_csv_path,))
+        # =====================================
+        # LOCAL TESTING MODE
+        # =====================================
+        LOGGER.log("=" * 60, "INFO")
+        LOGGER.log("RUNNING IN LOCAL TESTING MODE", "INFO")
+        LOGGER.log("=" * 60, "INFO")
+        LOGGER.log(f"Using test file: {test_csv_path}", "INFO")
+        
+        # Check if test file exists
+        if os.path.exists(test_csv_path):
+            LOGGER.log("Test file found", "INFO")
+        else:
+            LOGGER.log(f"Test file not found at {test_csv_path}", "WARN")
+            LOGGER.log("Will attempt to run anyway...", "WARN")
+        
+        # Run local gateway for testing
+        try:
+            inference_server.run_local_gateway((test_csv_path,))
+        except Exception as e:
+            LOGGER.log_error(e, "local gateway")
+        
+        # Log final summary
+        LOGGER.log_summary()
