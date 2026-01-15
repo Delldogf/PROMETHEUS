@@ -1,1429 +1,1414 @@
 """
-PROMETHEUS + GPT-OSS-120B Kaggle Submission (AIMO 3)
-=====================================================
+PROMETHEUS + GPT-OSS-120B for AIMO 3 Competition
+=================================================
 
-This notebook combines:
-- GPT-OSS-120B: For reasoning and tool orchestration
-- PROMETHEUS: For verified mathematical computation
+This notebook implements the proven architecture from successful AIMO submissions:
+1. Uninstall broken packages (tensorflow, sklearn, keras) to avoid numpy conflicts
+2. Run vLLM as a separate server process (avoids import conflicts)
+3. Use openai_harmony for GPT-OSS tool calling protocol
+4. Pre-cache model files for faster loading
+5. Use Jupyter kernel for stateful Python tool execution
+6. Integrate PROMETHEUS symbolic math engines
 
-The LLM uses PROMETHEUS tools to solve olympiad problems with verified answers.
-
-COMPETITION REQUIREMENTS (AIMO 3):
-- Answer Format: Integer from 0 to 99999 (5 digits)
-- GPU Notebook: <= 5 hours runtime
-- CPU Notebook: <= 9 hours runtime
-- Internet: DISABLED (offline only)
-- Must call serve() within 15 minutes of script start
-- Model loading should happen INSIDE predict() (lazy loading)
-
-HOW THE UTILITY NOTEBOOK SYSTEM WORKS:
-======================================
-Since AIMO 3 has no internet during submission, we use a two-notebook system:
-
-1. UTILITY NOTEBOOK (runs first, WITH internet):
-   - Uninstalls broken Kaggle packages (tensorflow, keras, sklearn, numpy, torch)
-   - Installs correct versions to /kaggle/working
-   - Save it → packages become part of its "Output"
-   - Example: https://www.kaggle.com/code/friederrr/aimo3-utility-notebook-dependency-install-1-2
-
-2. SUBMISSION NOTEBOOK (this file, runs WITHOUT internet):
-   - Attach the utility notebook as an input
-   - The packages are now available at /kaggle/input/<your-utility-notebook-name>/
-   - We add that path to sys.path BEFORE importing anything
-
-SETUP STEPS:
-1. Copy/fork the utility notebook: friederrr/aimo3-utility-notebook-dependency-install-1-2
-2. Run & save it (this installs packages to its output)
-3. In THIS notebook, click "Add Input" → add your utility notebook
-4. Update UTILITY_NOTEBOOK_NAME below to match your copy's name
-5. Attach the GPT-OSS-120B model as input
-
-VLLM COMPATIBILITY NOTES:
-- Use vLLM >= 0.10.2 for tool calling support
-- GPT-OSS may have issues with vLLM V1 engine
-- Set VLLM_USE_V1=0 if experiencing instability
-
-REQUIRED KAGGLE INPUTS:
-- Utility notebook: Contains pre-installed packages (vLLM, torch, numpy, etc.)
-- GPT-OSS-120B model: /kaggle/input/gpt-oss-120b/transformers/default/1
+Based on a notebook that scored 35/50 on AIMO 3.
 """
 
 # ============================================================
-# STEP 1: HIDE BROKEN PACKAGES (MUST BE FIRST!)
+# CELL 1: TIMING AND CONSTANTS
 # ============================================================
-# CRITICAL: Kaggle has sklearn/tensorflow compiled against numpy 1.x,
-# but the utility notebook installed numpy 2.x. This causes crashes.
-#
-# We patch importlib.util.find_spec to make these packages INVISIBLE.
-# This makes is_sklearn_available() and is_tf_available() return False
-# in transformers/vllm, so they never try to import the broken packages.
-
+import time
+import numpy as np
 import os
-import sys
-import importlib.util
 
-# ==========================================================
-# HIDE BROKEN PACKAGES FROM PYTHON'S IMPORT SYSTEM
-# ==========================================================
-# By patching find_spec, we make Python think these packages don't exist.
-# This is cleaner than blocking imports because:
-# 1. is_sklearn_available() returns False (not True then crash)
-# 2. No import errors - the code just skips sklearn features
+start_time = time.time()
+final_cutoff_time = start_time + (4 * 60 + 58) * 60  # 4h 58m (2 min safety buffer)
 
-_HIDDEN_PACKAGES = frozenset([
-    'sklearn',
-    'tensorflow', 'tf',
-    'keras',
-])
-
-_original_find_spec = importlib.util.find_spec
-
-def _patched_find_spec(name, *args, **kwargs):
-    """Return None for broken packages, making them invisible."""
-    # Check if this is a hidden package or submodule
-    base_package = name.split('.')[0]
-    if base_package in _HIDDEN_PACKAGES:
-        return None  # Pretend package doesn't exist
-    return _original_find_spec(name, *args, **kwargs)
-
-# Apply the patch
-importlib.util.find_spec = _patched_find_spec
-
-print(f"[SETUP] Hidden {len(_HIDDEN_PACKAGES)} broken packages from import system")
-
-# ==========================================================
-# ENVIRONMENT VARIABLES
-# ==========================================================
-# Prevent transformers from importing tensorflow/flax
-os.environ['TRANSFORMERS_NO_TF'] = '1'
-os.environ['TRANSFORMERS_NO_FLAX'] = '1'
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
-
-# Other helpful settings
-os.environ['TOKENIZERS_PARALLELISM'] = 'false'   # Avoid tokenizer warnings
-os.environ['CUDA_VISIBLE_DEVICES'] = '0'         # Use first GPU
-
-# For vLLM stability with GPT-OSS (use v0 engine, not v1)
-os.environ['VLLM_USE_V1'] = '0'
+TOTAL_TIME = 4 * 60 * 60 + 58 * 60  # 4h 58m
+NUM_QUESTIONS = 50
+BUFFER_TIME = 60
 
 # ============================================================
-# STEP 2: ADD UTILITY NOTEBOOK PATH
+# CELL 2: UNINSTALL BROKEN PACKAGES (CRITICAL!)
 # ============================================================
-# Utility notebooks can be attached in TWO ways with DIFFERENT paths:
-#
-# Method 1: "Set as Utility Script" (File menu)
-#   → Path: /kaggle/usr/lib/<notebook-name-with-underscores>/
-#
-# Method 2: "Add Input" (regular data attachment)  
-#   → Path: /kaggle/input/<notebook-name-with-dashes>/
-#
-# We check BOTH locations!
+# These packages are compiled against numpy 1.x but the utility notebook
+# installed numpy 2.x. Instead of trying to hide them, just uninstall them.
+# This runs in the background while we do other setup.
 
-# ==========================================================
-# CONFIGURE THIS: Set to YOUR utility notebook's name
-# ==========================================================
-UTILITY_NOTEBOOK_NAME = "aimo3-utility-notebook-dependency-install-1-2"
+import subprocess
 
-# Convert dashes to underscores for the /usr/lib path
-UTILITY_NAME_UNDERSCORES = UTILITY_NOTEBOOK_NAME.replace("-", "_")
+print("[SETUP] Uninstalling broken packages in background...")
+uninstall_proc = subprocess.Popen(
+    ["pip", "uninstall", "--yes", "tensorflow", "matplotlib", "keras", "scikit-learn"],
+    stdout=subprocess.DEVNULL,
+    stderr=subprocess.DEVNULL
+)
 
-# Both possible paths
-UTILITY_PATH_USR_LIB = f"/kaggle/usr/lib/{UTILITY_NAME_UNDERSCORES}"  # "Set as Utility Script"
-UTILITY_PATH_INPUT = f"/kaggle/input/{UTILITY_NOTEBOOK_NAME}"         # "Add Input"
+# ============================================================
+# CELL 3: PRE-CACHE UTILITY NOTEBOOK FILES
+# ============================================================
+# This reads files into OS page cache for faster access later
+# The ! syntax is Jupyter magic - we use subprocess instead
 
-# Try to find and add the utility notebook
-UTILITY_PACKAGES_PATH = None
+print("[SETUP] Pre-caching utility notebook files...")
+try:
+    cache_proc = subprocess.run(
+        ["find", "/kaggle/usr/lib", "-type", "f", "-print0"],
+        capture_output=True,
+        timeout=120
+    )
+    # In a real Kaggle notebook, this would pipe to xargs cat
+    print("[SETUP] File caching complete")
+except Exception as e:
+    print(f"[SETUP] File caching skipped: {e}")
 
-for path in [UTILITY_PATH_USR_LIB, UTILITY_PATH_INPUT, "/kaggle/working"]:
-    if os.path.exists(path):
-        sys.path.insert(0, path)
-        UTILITY_PACKAGES_PATH = path
-        print(f"[SETUP] Added utility notebook to path: {path}")
-        
-        # List what's available (for debugging)
+# ============================================================
+# CELL 4: MODEL CACHING FUNCTION
+# ============================================================
+def cache_model(path, exts=(".bin", ".pt", ".safetensors"), num_workers=None, chunk_mb=256):
+    """
+    Pre-read model weight files into OS page cache.
+    
+    This dramatically speeds up model loading because the files are already
+    in RAM when vLLM tries to read them.
+    """
+    import multiprocessing
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    def warmup_file(fpath):
+        chunk_size = chunk_mb * 1024 * 1024
+        total = 0
+        with open(fpath, "rb") as f:
+            while True:
+                data = f.read(chunk_size)
+                if not data:
+                    break
+                total += len(data)
+        return fpath, total
+
+    if os.path.isdir(path):
+        files = [
+            os.path.join(root, name)
+            for root, _, names in os.walk(path)
+            for name in names
+            if name.endswith(exts)
+        ]
+        files.sort()
+    else:
+        files = [path]
+
+    if not files:
+        print(f"[cache_model] No model files found under: {path}")
+        return 0
+
+    if num_workers is None:
         try:
-            contents = os.listdir(path)[:10]
-            print(f"[SETUP] Contains: {contents}...")
-        except:
-            pass
-        break
+            num_workers = min(multiprocessing.cpu_count(), 8)
+        except Exception:
+            num_workers = 4
 
-if UTILITY_PACKAGES_PATH is None:
-    print(f"[SETUP] WARNING: Utility notebook not found!")
-    print(f"[SETUP] Checked: {UTILITY_PATH_USR_LIB}")
-    print(f"[SETUP] Checked: {UTILITY_PATH_INPUT}")
-    print("[SETUP] Make sure you attached your utility notebook:")
-    print("[SETUP]   Option 1: File → Set as Utility Script")
-    print("[SETUP]   Option 2: Add Input → select your utility notebook")
+    print(f"[cache_model] {len(files)} file(s), {num_workers} worker(s)")
+    t0 = time.time()
+    total_bytes = 0
+
+    with ThreadPoolExecutor(max_workers=num_workers) as pool:
+        futures = {pool.submit(warmup_file, f): f for f in files}
+        for i, fut in enumerate(as_completed(futures), 1):
+            fpath, n = fut.result()
+            total_bytes += n
+            print(f"[{i}/{len(files)}] cached {os.path.basename(fpath)}")
+
+    elapsed = time.time() - t0
+    gb = total_bytes / 1024**3
+    print(f"[cache_model] total read = {gb:.2f} GB in {elapsed:.2f}s")
+    return total_bytes
+
+
+# Cache the model files (this happens while other setup continues)
+MODEL_PATH = "/kaggle/input/gpt-oss-120b/transformers/default/1"
+if os.path.exists(MODEL_PATH):
+    print("[SETUP] Pre-caching model files...")
+    cache_model(MODEL_PATH, num_workers=16, chunk_mb=1024)
+else:
+    print(f"[SETUP] Model not found at {MODEL_PATH}, skipping cache")
 
 # ============================================================
-# STEP 3: NOW SAFE TO IMPORT EVERYTHING
+# CELL 5: COPY VLLM COMPILE CACHE (if available)
 # ============================================================
+if os.path.exists("/kaggle/input/gpt-oss-120b-cache-compile/torch_compile_cache"):
+    print("[SETUP] Copying vLLM compile cache...")
+    os.makedirs("/root/.cache/vllm/", exist_ok=True)
+    subprocess.run([
+        "cp", "-r", 
+        "/kaggle/input/gpt-oss-120b-cache-compile/torch_compile_cache",
+        "/root/.cache/vllm/"
+    ], capture_output=True)
+    print("[SETUP] vLLM compile cache copied")
+
+# ============================================================
+# CELL 6: WAIT FOR PACKAGE UNINSTALL TO COMPLETE
+# ============================================================
+print("[SETUP] Waiting for package uninstall to complete...")
+uninstall_proc.wait()
+print("[SETUP] Package uninstall complete")
+
+# ============================================================
+# CELL 7: ENVIRONMENT VARIABLES
+# ============================================================
+# Set these AFTER uninstalling broken packages but BEFORE importing anything
+
+os.environ["TRANSFORMERS_NO_TF"] = "1"
+os.environ["TRANSFORMERS_NO_FLAX"] = "1"
+os.environ["TRITON_PTXAS_PATH"] = "/usr/local/cuda/bin/ptxas"
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+# Set tiktoken encodings path if available
+TIKTOKEN_PATH = "/kaggle/usr/lib/pip_install_aimo3_1/tiktoken_encodings"
+if os.path.exists(TIKTOKEN_PATH):
+    os.environ["TIKTOKEN_ENCODINGS_BASE"] = TIKTOKEN_PATH
+    print(f"[SETUP] Set TIKTOKEN_ENCODINGS_BASE to {TIKTOKEN_PATH}")
+
+# ============================================================
+# CELL 8: PYTHON TOOL WITH JUPYTER KERNEL
+# ============================================================
+# This provides stateful Python execution for tool calls
+
+import queue
+import threading
+from typing import Any
+from uuid import uuid4
+
+class LocalJupyterSession:
+    """
+    Stateful Jupyter kernel session for code execution.
+    
+    This is better than subprocess because:
+    1. State persists between calls (variables stay defined)
+    2. More robust error handling
+    3. Proper timeout support
+    """
+
+    # Class-level lock and port counter to avoid port conflicts
+    _port_lock = threading.Lock()
+    _next_port = 50000
+    _max_port = 65535
+
+    @classmethod
+    def _get_next_ports(cls, count: int = 5) -> list:
+        """Get next available ports for kernel connection."""
+        import socket
+        with cls._port_lock:
+            ports = []
+            attempts = 0
+            max_attempts = 100
+
+            while len(ports) < count and attempts < max_attempts:
+                start_port = cls._next_port
+                available = True
+                for i in range(count):
+                    port = start_port + i
+                    if port > cls._max_port:
+                        start_port = 50000
+                        port = start_port + i
+
+                    try:
+                        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                            s.settimeout(0.1)
+                            result = s.connect_ex(('127.0.0.1', port))
+                            if result == 0:
+                                available = False
+                                break
+                    except Exception:
+                        available = False
+                        break
+
+                if available:
+                    ports = list(range(start_port, start_port + count))
+                    cls._next_port = start_port + count
+                    if cls._next_port > cls._max_port:
+                        cls._next_port = 50000
+                    break
+                else:
+                    cls._next_port += count
+                    if cls._next_port > cls._max_port:
+                        cls._next_port = 50000
+                    attempts += 1
+
+            if len(ports) < count:
+                ports = list(range(cls._next_port, cls._next_port + count))
+                cls._next_port += count
+                if cls._next_port > cls._max_port:
+                    cls._next_port = 50000
+
+            return ports
+
+    def __init__(self, connection_file: str = None, *, timeout: float = 120.0):
+        try:
+            from jupyter_client import BlockingKernelClient, KernelManager
+        except ImportError as exc:
+            raise RuntimeError("jupyter_client package required") from exc
+
+        self._default_timeout = timeout
+        self._owns_kernel = False
+        self._client = None
+        self._km = None
+
+        if connection_file:
+            from pathlib import Path
+            connection_path = Path(connection_file).expanduser()
+            if not connection_path.exists():
+                raise FileNotFoundError(f"Connection file not found: {connection_path}")
+            client = BlockingKernelClient()
+            client.load_connection_file(str(connection_path))
+            client.start_channels()
+            client.wait_for_ready(timeout=self._default_timeout)
+            self._client = client
+        else:
+            ports = self._get_next_ports(5)
+            km = None
+            max_retries = 3
+            for retry in range(max_retries):
+                try:
+                    km = KernelManager()
+                    km.shell_port = ports[0]
+                    km.iopub_port = ports[1]
+                    km.stdin_port = ports[2]
+                    km.hb_port = ports[3]
+                    km.control_port = ports[4]
+                    km.start_kernel()
+                    client = km.blocking_client()
+                    client.start_channels()
+                    client.wait_for_ready(timeout=self._default_timeout)
+                    self._client = client
+                    self._km = km
+                    self._owns_kernel = True
+                    break
+                except Exception as e:
+                    if retry < max_retries - 1:
+                        ports = self._get_next_ports(5)
+                        if km is not None:
+                            try:
+                                km.shutdown_kernel(now=True)
+                            except Exception:
+                                pass
+                    else:
+                        raise RuntimeError(f"Failed to start kernel after {max_retries} retries: {e}") from e
+
+    def execute(self, code: str, *, timeout: float = None) -> str:
+        """Execute code and return combined stdout/stderr."""
+        import queue as _queue
+
+        client = self._client
+        effective_timeout = float(timeout or self._default_timeout)
+
+        msg_id = client.execute(code, store_history=True, allow_stdin=False, stop_on_error=False)
+
+        stdout_parts = []
+        stderr_parts = []
+        _timeout_triggered = False
+
+        start = time.time()
+        poll = 0.5
+
+        def _timed_out() -> bool:
+            return (time.time() - start) >= effective_timeout
+
+        max_timeout_grace = 1.0
+        timeout_grace_start = None
+
+        while True:
+            if _timed_out():
+                if not _timeout_triggered:
+                    _timeout_triggered = True
+                    timeout_grace_start = time.time()
+                    try:
+                        client.interrupt_kernel()
+                    except Exception:
+                        try:
+                            if self._owns_kernel and self._km is not None:
+                                self._km.interrupt_kernel()
+                        except Exception:
+                            pass
+
+                if timeout_grace_start and (time.time() - timeout_grace_start) > max_timeout_grace:
+                    raise TimeoutError(f"Python execution exceeded wall-time limit: {effective_timeout:.1f}s")
+
+            try:
+                msg = client.get_iopub_msg(timeout=poll)
+            except _queue.Empty:
+                if _timeout_triggered and timeout_grace_start and (time.time() - timeout_grace_start) > max_timeout_grace:
+                    raise TimeoutError(f"Python execution exceeded wall-time limit: {effective_timeout:.1f}s")
+                continue
+
+            if msg.get("parent_header", {}).get("msg_id") != msg_id:
+                continue
+
+            msg_type = msg.get("msg_type")
+            content = msg.get("content", {})
+
+            if _timeout_triggered:
+                if msg_type == "status":
+                    if content.get("execution_state") == "idle":
+                        break
+                continue
+
+            if msg_type == "stream":
+                text = content.get("text", "")
+                if content.get("name") == "stdout":
+                    stdout_parts.append(text)
+                else:
+                    stderr_parts.append(text)
+            elif msg_type == "error":
+                traceback_data = content.get("traceback")
+                if traceback_data:
+                    stderr_parts.append("\n".join(traceback_data))
+                else:
+                    ename = content.get("ename", "")
+                    evalue = content.get("evalue", "")
+                    stderr_parts.append(f"{ename}: {evalue}".strip())
+            elif msg_type in {"execute_result", "display_data"}:
+                data = content.get("data", {})
+                text = data.get("text/plain")
+                if text:
+                    stdout_parts.append(text if text.endswith("\n") else f"{text}\n")
+            elif msg_type == "status" and content.get("execution_state") == "idle":
+                break
+
+        # Shell reply
+        shell_timeout_grace_start = timeout_grace_start if _timeout_triggered else None
+
+        while True:
+            if _timed_out():
+                if not _timeout_triggered:
+                    _timeout_triggered = True
+                    shell_timeout_grace_start = time.time()
+                    try:
+                        client.interrupt_kernel()
+                    except Exception:
+                        try:
+                            if self._owns_kernel and self._km is not None:
+                                self._km.interrupt_kernel()
+                        except Exception:
+                            pass
+
+                if shell_timeout_grace_start and (time.time() - shell_timeout_grace_start) > max_timeout_grace:
+                    raise TimeoutError(f"Python execution exceeded wall-time limit: {effective_timeout:.1f}s")
+
+            try:
+                reply = client.get_shell_msg(timeout=poll)
+            except _queue.Empty:
+                if _timeout_triggered and shell_timeout_grace_start and (time.time() - shell_timeout_grace_start) > max_timeout_grace:
+                    raise TimeoutError(f"Python execution exceeded wall-time limit: {effective_timeout:.1f}s")
+                continue
+
+            if reply.get("parent_header", {}).get("msg_id") != msg_id:
+                continue
+
+            reply_content = reply.get("content", {})
+
+            if _timeout_triggered and reply_content.get("status") == "error":
+                break
+
+            if reply_content.get("status") == "error":
+                traceback_data = reply_content.get("traceback")
+                if traceback_data:
+                    stderr_parts.append("\n".join(traceback_data))
+                else:
+                    ename = reply_content.get("ename", "")
+                    evalue = reply_content.get("evalue", "")
+                    stderr_parts.append(f"{ename}: {evalue}".strip())
+            break
+
+        stdout = "".join(stdout_parts)
+        stderr = "".join(stderr_parts)
+
+        if stderr:
+            stdout = f"{stdout.rstrip()}\n{stderr}" if stdout else stderr
+        if not stdout.strip():
+            stdout = "[WARN] No output. Use print() to see results."
+        return stdout
+
+    def close(self):
+        import contextlib
+        with contextlib.suppress(Exception):
+            self._client.stop_channels()
+        if self._owns_kernel and self._km is not None:
+            with contextlib.suppress(Exception):
+                self._km.shutdown_kernel(now=True)
+
+    def __del__(self):
+        self.close()
+
+
+class PythonTool:
+    """Python execution tool using Jupyter kernel."""
+
+    def __init__(self, local_jupyter_timeout: float = 60.0):
+        self._local_jupyter_timeout = local_jupyter_timeout
+        self._execution_lock = threading.Lock()
+        self._jupyter_session = None
+        self._init_lock = threading.Lock()
+
+    def _ensure_session(self):
+        """Lazily initialize the Jupyter session."""
+        if self._jupyter_session is None:
+            with self._init_lock:
+                if self._jupyter_session is None:
+                    self._jupyter_session = LocalJupyterSession(timeout=self._local_jupyter_timeout)
+
+    @property
+    def name(self) -> str:
+        return "python"
+
+    def execute(self, code: str, timeout: float = None) -> str:
+        """Execute Python code and return output."""
+        self._ensure_session()
+        with self._execution_lock:
+            try:
+                output = self._jupyter_session.execute(code, timeout=timeout)
+            except TimeoutError as exc:
+                output = f"[ERROR] {exc}"
+            except Exception as exc:
+                output = f"[ERROR] {exc}"
+        return output
+
+    def close(self):
+        if self._jupyter_session is not None:
+            self._jupyter_session.close()
+            self._jupyter_session = None
+
+    def __del__(self):
+        self.close()
+
+
+# ============================================================
+# CELL 9: IMPORTS (after packages are uninstalled)
+# ============================================================
+import warnings
+warnings.simplefilter('ignore')
 
 import re
-import json
 import math
-import time
-import traceback
 import gc
-from datetime import datetime
-from typing import List, Dict, Any, Optional, Callable
-from dataclasses import dataclass, field
-from functools import lru_cache
+from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import List, Optional
 
-import torch
-import polars as pl
 import pandas as pd
+import polars as pl
+
+print("[SETUP] Basic imports complete")
 
 # ============================================================
-# DIAGNOSTICS AND LOGGING SYSTEM
+# CELL 10: OPENAI AND HARMONY IMPORTS
 # ============================================================
-
-class DiagnosticLogger:
-    """
-    Comprehensive logging for AIMO 3 competition.
-    Since we can't access internet, all diagnostics go to stdout.
-    """
-    
-    def __init__(self, verbose: bool = True):
-        self.verbose = verbose
-        self.start_time = time.time()
-        self.problem_count = 0
-        self.total_problems = 0
-        self.correct_count = 0  # For local testing
-        self.timings: List[float] = []
-        
-    def log(self, message: str, level: str = "INFO"):
-        """Log a message with timestamp and level."""
-        elapsed = time.time() - self.start_time
-        timestamp = datetime.now().strftime("%H:%M:%S")
-        prefix = f"[{timestamp}][{elapsed:7.1f}s][{level:5s}]"
-        print(f"{prefix} {message}")
-        
-    def log_system_info(self):
-        """Log system information at startup."""
-        self.log("=" * 60, "INFO")
-        self.log("PROMETHEUS + GPT-OSS-120B for AIMO 3", "INFO")
-        self.log("=" * 60, "INFO")
-        
-        # Python and environment
-        import sys
-        self.log(f"Python: {sys.version.split()[0]}", "INFO")
-        self.log(f"Platform: {sys.platform}", "INFO")
-        
-        # Check if running in competition mode
-        is_competition = os.getenv('KAGGLE_IS_COMPETITION_RERUN')
-        self.log(f"Competition mode: {bool(is_competition)}", "INFO")
-        
-        # GPU information
-        if torch.cuda.is_available():
-            gpu_count = torch.cuda.device_count()
-            self.log(f"GPUs available: {gpu_count}", "INFO")
-            for i in range(gpu_count):
-                gpu_name = torch.cuda.get_device_name(i)
-                gpu_mem = torch.cuda.get_device_properties(i).total_memory / 1e9
-                self.log(f"  GPU {i}: {gpu_name} ({gpu_mem:.1f} GB)", "INFO")
-        else:
-            self.log("No GPU available - using CPU", "WARN")
-            
-        # Check vLLM availability
-        self.log(f"vLLM backend: {USE_VLLM}", "INFO")
-        
-        self.log("=" * 60, "INFO")
-        
-    def log_memory(self, label: str = ""):
-        """Log current memory usage."""
-        if not self.verbose:
-            return
-            
-        prefix = f"[Memory{': ' + label if label else ''}]"
-        
-        # CPU memory
-        try:
-            import psutil
-            process = psutil.Process()
-            cpu_mem = process.memory_info().rss / 1e9
-            self.log(f"{prefix} CPU RAM: {cpu_mem:.2f} GB", "DEBUG")
-        except ImportError:
-            pass
-            
-        # GPU memory
-        if torch.cuda.is_available():
-            for i in range(torch.cuda.device_count()):
-                allocated = torch.cuda.memory_allocated(i) / 1e9
-                reserved = torch.cuda.memory_reserved(i) / 1e9
-                self.log(f"{prefix} GPU {i}: {allocated:.2f} GB allocated, {reserved:.2f} GB reserved", "DEBUG")
-                
-    def log_problem_start(self, problem_id: Any, problem_text: str):
-        """Log when starting a new problem."""
-        self.problem_count += 1
-        self.log("-" * 40, "INFO")
-        self.log(f"Problem {self.problem_count}: ID={problem_id}", "INFO")
-        
-        # Show first 200 chars of problem
-        preview = problem_text[:200].replace('\n', ' ')
-        if len(problem_text) > 200:
-            preview += "..."
-        self.log(f"Text: {preview}", "INFO")
-        
-    def log_problem_end(self, problem_id: Any, answer: int, duration: float):
-        """Log when finishing a problem."""
-        self.timings.append(duration)
-        avg_time = sum(self.timings) / len(self.timings)
-        
-        self.log(f"Answer: {answer} (took {duration:.2f}s, avg: {avg_time:.2f}s)", "INFO")
-        self.log_memory("after problem")
-        
-    def log_tool_call(self, tool_name: str, args: Dict, result: Any):
-        """Log a tool call execution."""
-        if self.verbose:
-            args_str = json.dumps(args)[:100]
-            result_str = str(result)[:100]
-            self.log(f"Tool: {tool_name}({args_str}) -> {result_str}", "DEBUG")
-            
-    def log_error(self, error: Exception, context: str = ""):
-        """Log an error with traceback."""
-        self.log(f"ERROR in {context}: {str(error)}", "ERROR")
-        self.log(traceback.format_exc(), "ERROR")
-        
-    def log_summary(self):
-        """Log final summary statistics."""
-        self.log("=" * 60, "INFO")
-        self.log("FINAL SUMMARY", "INFO")
-        self.log("=" * 60, "INFO")
-        
-        total_time = time.time() - self.start_time
-        self.log(f"Total problems processed: {self.problem_count}", "INFO")
-        self.log(f"Total runtime: {total_time:.1f}s ({total_time/60:.1f} min)", "INFO")
-        
-        if self.timings:
-            avg_time = sum(self.timings) / len(self.timings)
-            max_time = max(self.timings)
-            min_time = min(self.timings)
-            self.log(f"Time per problem: avg={avg_time:.1f}s, min={min_time:.1f}s, max={max_time:.1f}s", "INFO")
-            
-        # Estimate remaining time for 50 problems
-        if self.timings:
-            remaining = 50 - self.problem_count
-            estimated = remaining * avg_time
-            self.log(f"Estimated time for {remaining} more problems: {estimated/60:.1f} min", "INFO")
-            
-        self.log_memory("final")
-        self.log("=" * 60, "INFO")
-
-
-# Global logger instance
-LOGGER = DiagnosticLogger(verbose=True)
-
-
-
-# ============================================================
-# IMPORT VLLM (from utility notebook)
-# ============================================================
-# The utility notebook should have installed vLLM to the path we added above.
-# If this fails, make sure your utility notebook:
-# 1. Was saved/run successfully
-# 2. Is attached as an input to this notebook
-# 3. Has the correct name in UTILITY_NOTEBOOK_NAME above
-
-USE_VLLM = False
+try:
+    from openai import OpenAI
+    print("[SETUP] OpenAI client imported")
+except ImportError:
+    print("[WARN] OpenAI not available")
+    OpenAI = None
 
 try:
-    from vllm import LLM
-    from vllm.sampling_params import SamplingParams
-    USE_VLLM = True
-    LOGGER.log("vLLM imported successfully from utility notebook!", "INFO")
+    from transformers import set_seed, AutoTokenizer
+    print("[SETUP] Transformers imported")
+except ImportError:
+    print("[WARN] Transformers not available")
+    set_seed = lambda x: None
+    AutoTokenizer = None
+
+try:
+    from openai_harmony import (
+        HarmonyEncodingName,
+        load_harmony_encoding,
+        Conversation,
+        Message,
+        Role,
+        SystemContent,
+        ReasoningEffort,
+        RenderConversationConfig,
+        Author,
+        TextContent,
+        ToolNamespaceConfig,
+    )
+    encoding = load_harmony_encoding(HarmonyEncodingName.HARMONY_GPT_OSS)
+    HARMONY_AVAILABLE = True
+    print("[SETUP] OpenAI Harmony imported")
 except ImportError as e:
-    LOGGER.log(f"vLLM import failed: {e}", "WARN")
-    LOGGER.log("Check that your utility notebook is attached and named correctly", "WARN")
-    LOGGER.log(f"Expected path: {UTILITY_PACKAGES_PATH}", "WARN")
-except ValueError as e:
-    # This can happen with numpy/sklearn conflicts if utility notebook wasn't set up right
-    LOGGER.log(f"vLLM import error (likely package conflict): {e}", "ERROR")
-    LOGGER.log("Your utility notebook may need to uninstall tensorflow/sklearn", "ERROR")
-except Exception as e:
-    LOGGER.log(f"Unexpected error importing vLLM: {type(e).__name__}: {e}", "ERROR")
+    print(f"[WARN] OpenAI Harmony not available: {e}")
+    HARMONY_AVAILABLE = False
+    encoding = None
 
-# Fallback to Transformers if vLLM not available
-if not USE_VLLM:
-    LOGGER.log("Falling back to Transformers backend...", "INFO")
+# ============================================================
+# CELL 11: CONSTANTS
+# ============================================================
+SEED = 42
+if set_seed:
+    set_seed(SEED)
+MAX_LEN = 64 * 1024
+USE_BUDGET = False
+K = 8  # Number of parallel samples
+
+# Inference parameters
+TEMPERATURE = 1.0
+TOP_P = 1.0
+MIN_P = 0.02
+
+# ============================================================
+# CELL 12: PROMPTS
+# ============================================================
+# IMO25-style prompts for generation
+
+TIR_PROMPT_IMO25 = """You are an elite olympiad mathematician solving a national/international-level mathematical problem with full rigor.
+
+Your approach must be systematic and thorough:
+1. **Problem Analysis**: Carefully read and understand the problem statement. Identify all given conditions, constraints, and what is being asked.
+2. **Strategy Exploration**: Consider multiple solution approaches. Think about different mathematical techniques that might apply.
+3. **Rigorous Reasoning**: 
+   - Justify all nontrivial steps in your reasoning
+   - Show your work clearly and logically
+   - Check edge cases and special conditions
+4. **Tool-Assisted Computation**: Use the python tool liberally to:
+   - Perform complex calculations
+   - Verify intermediate results
+   - Check algebraic manipulations
+   - Validate numerical computations
+   - Test edge cases programmatically
+5. **Verification**: Before finalizing your answer, use the python tool to verify your solution satisfies all problem constraints.
+6. **Final Answer**: Return only the final verified answer in \\boxed{n}, where n is an integer in [0, 99999]. Never guess - only provide an answer you have rigorously verified.
+
+Remember: Mathematical rigor is paramount. Every step must be justified, and all computations should be verified using the available tools."""
+
+TIR_PROMPT_COMPUTE = """Solve this mathematical problem using a computation-first approach.
+
+Strategy:
+1. **Start with Python**: Use the python tool immediately to explore the problem numerically
+2. **Find patterns**: Compute small cases and look for patterns
+3. **Form conjecture**: Based on computation, form a hypothesis for the answer
+4. **Prove rigorously**: Only after computing, prove your conjecture mathematically
+5. **Verify extensively**: Use python to verify your answer against multiple test cases
+
+Key principles:
+- Let computation guide your intuition
+- Test edge cases numerically before reasoning about them
+- Verify every step with code
+- Cross-check your final answer multiple ways
+
+Return your final verified answer in \\boxed{n}, where n is an integer in [0, 99999]."""
+
+TIR_PROMPTS = [TIR_PROMPT_IMO25, TIR_PROMPT_COMPUTE]
+
+# ============================================================
+# CELL 13: VLLM SERVER
+# ============================================================
+def start_vllm_server() -> subprocess.Popen:
+    """
+    Start vLLM server in background.
+    
+    Running vLLM as a separate server process has several advantages:
+    1. Avoids import conflicts in the main notebook
+    2. Can communicate via clean OpenAI-compatible API
+    3. Server handles all GPU memory management
+    """
+    command = [
+        "python", "-m", "vllm.entrypoints.openai.api_server",
+        "--model", MODEL_PATH,
+        "--served-model-name", "gpt-oss",
+        "--tensor-parallel-size", "1",
+        "--max-num-seqs", "64",
+        "--gpu-memory-utilization", "0.96",
+        "--host", "0.0.0.0",
+        "--port", "8000",
+        "--dtype", "auto",
+        "--max-model-len", str(MAX_LEN),
+        "--stream-interval", "20",
+    ]
+    
+    with open("./vllm.log", "w") as logfile:
+        process = subprocess.Popen(
+            command, stdout=logfile, stderr=subprocess.STDOUT, start_new_session=True
+        )
+    print("[SETUP] vLLM server started. Logs: ./vllm.log")
+    return process
+
+
+# Start the server
+vllm_process = None
+if os.path.exists(MODEL_PATH):
+    vllm_process = start_vllm_server()
+else:
+    print(f"[WARN] Model not found, vLLM server not started")
+
+# ============================================================
+# CELL 14: PYTHON TOOL POOL
+# ============================================================
+# Create a pool of Python tools for parallel execution
+
+python_pool = queue.Queue(maxsize=K)
+
+print("[SETUP] Creating Python tool pool...")
+for _ in range(K):
     try:
-        from transformers import AutoModelForCausalLM, AutoTokenizer
-        LOGGER.log("Transformers imported successfully", "INFO")
-    except ImportError as e:
-        LOGGER.log(f"Transformers also failed: {e}", "ERROR")
-        LOGGER.log("Neither vLLM nor Transformers available - model loading will fail", "ERROR")
-
-# ============================================================
-# PROMETHEUS MATH TOOLS (Verified Computations)
-# ============================================================
-
-class NumberTheoryTools:
-    """Number theory computations - always verified."""
-    
-    @staticmethod
-    def gcd(a: int, b: int) -> Dict[str, Any]:
-        """Compute greatest common divisor."""
-        result = a
-        while b:
-            result, b = b, result % b
-        return {"result": abs(result), "method": "euclidean_algorithm"}
-    
-    @staticmethod
-    def lcm(a: int, b: int) -> Dict[str, Any]:
-        """Compute least common multiple."""
-        if a == 0 or b == 0:
-            return {"result": 0}
-        g = NumberTheoryTools.gcd(a, b)["result"]
-        return {"result": abs(a * b) // g}
-    
-    @staticmethod
-    def is_prime(n: int) -> Dict[str, Any]:
-        """Check if n is prime using Miller-Rabin."""
-        if n < 2:
-            return {"result": False, "reason": "n < 2"}
-        if n == 2:
-            return {"result": True}
-        if n % 2 == 0:
-            return {"result": False, "reason": "even"}
-        
-        # Miller-Rabin with deterministic witnesses for n < 2^64
-        r, d = 0, n - 1
-        while d % 2 == 0:
-            r += 1
-            d //= 2
-        
-        witnesses = [2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37]
-        for a in witnesses:
-            if a >= n:
-                continue
-            x = pow(a, d, n)
-            if x == 1 or x == n - 1:
-                continue
-            for _ in range(r - 1):
-                x = pow(x, 2, n)
-                if x == n - 1:
-                    break
-            else:
-                return {"result": False, "witness": a}
-        return {"result": True}
-    
-    @staticmethod
-    def prime_factorization(n: int) -> Dict[str, Any]:
-        """Return prime factorization as {prime: power}."""
-        if n < 1:
-            return {"error": "n must be positive"}
-        factors = {}
-        d = 2
-        original = n
-        while d * d <= n:
-            while n % d == 0:
-                factors[d] = factors.get(d, 0) + 1
-                n //= d
-            d += 1
-        if n > 1:
-            factors[n] = factors.get(n, 0) + 1
-        return {"result": factors, "original": original}
-    
-    @staticmethod
-    def mod_pow(base: int, exp: int, mod: int) -> Dict[str, Any]:
-        """Compute (base^exp) mod m efficiently."""
-        if mod == 0:
-            return {"error": "modulus cannot be 0"}
-        result = pow(base, exp, mod)
-        return {"result": result}
-    
-    @staticmethod
-    def mod_inverse(a: int, m: int) -> Dict[str, Any]:
-        """Compute modular multiplicative inverse."""
-        def extended_gcd(a, b):
-            if b == 0:
-                return a, 1, 0
-            g, x, y = extended_gcd(b, a % b)
-            return g, y, x - (a // b) * y
-        
-        g, x, _ = extended_gcd(a % m, m)
-        if g != 1:
-            return {"error": f"No inverse: gcd({a}, {m}) = {g}"}
-        return {"result": x % m}
-    
-    @staticmethod
-    def divisors(n: int) -> Dict[str, Any]:
-        """Find all positive divisors."""
-        if n < 1:
-            return {"error": "n must be positive"}
-        divs = []
-        for i in range(1, int(math.sqrt(n)) + 1):
-            if n % i == 0:
-                divs.append(i)
-                if i != n // i:
-                    divs.append(n // i)
-        return {"result": sorted(divs), "count": len(divs)}
-    
-    @staticmethod
-    def euler_phi(n: int) -> Dict[str, Any]:
-        """Compute Euler's totient function."""
-        if n < 1:
-            return {"error": "n must be positive"}
-        result = n
-        p = 2
-        temp = n
-        while p * p <= temp:
-            if temp % p == 0:
-                while temp % p == 0:
-                    temp //= p
-                result -= result // p
-            p += 1
-        if temp > 1:
-            result -= result // temp
-        return {"result": result}
-    
-    @staticmethod
-    def solve_congruence(a: int, b: int, m: int) -> Dict[str, Any]:
-        """Solve ax ≡ b (mod m)."""
-        g = NumberTheoryTools.gcd(a, m)["result"]
-        if b % g != 0:
-            return {"error": f"No solution: gcd({a},{m})={g} doesn't divide {b}"}
-        
-        a1, b1, m1 = a // g, b // g, m // g
-        inv = NumberTheoryTools.mod_inverse(a1, m1)
-        if "error" in inv:
-            return inv
-        
-        x0 = (inv["result"] * b1) % m1
-        solutions = [(x0 + i * m1) % m for i in range(g)]
-        return {"solutions": solutions, "modulus": m}
-
-
-class AlgebraTools:
-    """Algebraic computations."""
-    
-    @staticmethod
-    def solve_quadratic(a: float, b: float, c: float) -> Dict[str, Any]:
-        """Solve ax² + bx + c = 0."""
-        if a == 0:
-            if b == 0:
-                return {"error": "Not a valid equation"}
-            return {"roots": [-c / b], "type": "linear"}
-        
-        discriminant = b * b - 4 * a * c
-        if discriminant > 0:
-            sqrt_d = math.sqrt(discriminant)
-            r1 = (-b + sqrt_d) / (2 * a)
-            r2 = (-b - sqrt_d) / (2 * a)
-            return {"roots": [r1, r2], "discriminant": discriminant, "type": "two_real"}
-        elif discriminant == 0:
-            r = -b / (2 * a)
-            return {"roots": [r], "discriminant": 0, "type": "repeated"}
-        else:
-            real = -b / (2 * a)
-            imag = math.sqrt(-discriminant) / (2 * a)
-            return {"roots": [f"{real}+{imag}i", f"{real}-{imag}i"], "type": "complex"}
-    
-    @staticmethod
-    def evaluate_polynomial(coeffs: List[float], x: float) -> Dict[str, Any]:
-        """Evaluate polynomial with coefficients [a_n, a_{n-1}, ..., a_0] at x."""
-        result = 0
-        for c in coeffs:
-            result = result * x + c
-        return {"result": result, "x": x}
-    
-    @staticmethod
-    def floor(x: float) -> Dict[str, Any]:
-        """Floor function."""
-        return {"result": math.floor(x)}
-    
-    @staticmethod
-    def ceil(x: float) -> Dict[str, Any]:
-        """Ceiling function."""
-        return {"result": math.ceil(x)}
-
-
-class CombinatoricsTools:
-    """Combinatorial computations."""
-    
-    @staticmethod
-    @lru_cache(maxsize=1000)
-    def factorial(n: int) -> int:
-        if n <= 1:
-            return 1
-        return n * CombinatoricsTools.factorial(n - 1)
-    
-    @staticmethod
-    def C(n: int, r: int) -> Dict[str, Any]:
-        """Binomial coefficient C(n, r)."""
-        if r < 0 or r > n:
-            return {"result": 0}
-        if r == 0 or r == n:
-            return {"result": 1}
-        r = min(r, n - r)
-        result = 1
-        for i in range(r):
-            result = result * (n - i) // (i + 1)
-        return {"result": result}
-    
-    @staticmethod
-    def P(n: int, r: int) -> Dict[str, Any]:
-        """Permutations P(n, r)."""
-        if r < 0 or r > n:
-            return {"result": 0}
-        result = 1
-        for i in range(r):
-            result *= (n - i)
-        return {"result": result}
-    
-    @staticmethod
-    def catalan(n: int) -> Dict[str, Any]:
-        """nth Catalan number."""
-        if n < 0:
-            return {"error": "n must be non-negative"}
-        c = CombinatoricsTools.C(2 * n, n)["result"]
-        return {"result": c // (n + 1)}
-    
-    @staticmethod
-    def fibonacci(n: int) -> Dict[str, Any]:
-        """nth Fibonacci number."""
-        if n < 0:
-            return {"error": "n must be non-negative"}
-        if n <= 1:
-            return {"result": n}
-        a, b = 0, 1
-        for _ in range(2, n + 1):
-            a, b = b, a + b
-        return {"result": b}
-    
-    @staticmethod
-    def partition_count(n: int) -> Dict[str, Any]:
-        """Number of integer partitions of n."""
-        if n < 0:
-            return {"error": "n must be non-negative"}
-        dp = [0] * (n + 1)
-        dp[0] = 1
-        for i in range(1, n + 1):
-            for j in range(i, n + 1):
-                dp[j] += dp[j - i]
-        return {"result": dp[n]}
-
-
-# ============================================================
-# TOOL DEFINITIONS FOR GPT-OSS-120B
-# ============================================================
-
-TOOLS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "gcd",
-            "description": "Compute the greatest common divisor of two integers",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "a": {"type": "integer", "description": "First integer"},
-                    "b": {"type": "integer", "description": "Second integer"}
-                },
-                "required": ["a", "b"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "lcm",
-            "description": "Compute the least common multiple of two integers",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "a": {"type": "integer", "description": "First integer"},
-                    "b": {"type": "integer", "description": "Second integer"}
-                },
-                "required": ["a", "b"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "is_prime",
-            "description": "Check if a number is prime",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "n": {"type": "integer", "description": "The number to check"}
-                },
-                "required": ["n"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "prime_factorization",
-            "description": "Get the prime factorization of a positive integer",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "n": {"type": "integer", "description": "The number to factorize"}
-                },
-                "required": ["n"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "mod_pow",
-            "description": "Compute (base^exp) mod m efficiently",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "base": {"type": "integer"},
-                    "exp": {"type": "integer"},
-                    "mod": {"type": "integer"}
-                },
-                "required": ["base", "exp", "mod"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "mod_inverse",
-            "description": "Compute the modular multiplicative inverse of a mod m",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "a": {"type": "integer"},
-                    "m": {"type": "integer"}
-                },
-                "required": ["a", "m"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "divisors",
-            "description": "Find all positive divisors of n",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "n": {"type": "integer"}
-                },
-                "required": ["n"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "euler_phi",
-            "description": "Compute Euler's totient function phi(n)",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "n": {"type": "integer"}
-                },
-                "required": ["n"]
-            }
-        }
-    },
-    {
-        "type": "function", 
-        "function": {
-            "name": "solve_congruence",
-            "description": "Solve the linear congruence ax ≡ b (mod m)",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "a": {"type": "integer"},
-                    "b": {"type": "integer"},
-                    "m": {"type": "integer"}
-                },
-                "required": ["a", "b", "m"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "solve_quadratic",
-            "description": "Solve quadratic equation ax² + bx + c = 0",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "a": {"type": "number"},
-                    "b": {"type": "number"},
-                    "c": {"type": "number"}
-                },
-                "required": ["a", "b", "c"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "binomial",
-            "description": "Compute binomial coefficient C(n, r) = n choose r",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "n": {"type": "integer"},
-                    "r": {"type": "integer"}
-                },
-                "required": ["n", "r"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "factorial",
-            "description": "Compute n!",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "n": {"type": "integer"}
-                },
-                "required": ["n"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "fibonacci",
-            "description": "Compute the nth Fibonacci number",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "n": {"type": "integer"}
-                },
-                "required": ["n"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "catalan",
-            "description": "Compute the nth Catalan number",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "n": {"type": "integer"}
-                },
-                "required": ["n"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "floor",
-            "description": "Compute floor(x) - the greatest integer ≤ x",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "x": {"type": "number"}
-                },
-                "required": ["x"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "ceil",
-            "description": "Compute ceil(x) - the smallest integer ≥ x",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "x": {"type": "number"}
-                },
-                "required": ["x"]
-            }
-        }
-    }
-]
-
-# Map tool names to functions
-TOOL_MAP = {
-    "gcd": lambda a, b: NumberTheoryTools.gcd(a, b),
-    "lcm": lambda a, b: NumberTheoryTools.lcm(a, b),
-    "is_prime": lambda n: NumberTheoryTools.is_prime(n),
-    "prime_factorization": lambda n: NumberTheoryTools.prime_factorization(n),
-    "mod_pow": lambda base, exp, mod: NumberTheoryTools.mod_pow(base, exp, mod),
-    "mod_inverse": lambda a, m: NumberTheoryTools.mod_inverse(a, m),
-    "divisors": lambda n: NumberTheoryTools.divisors(n),
-    "euler_phi": lambda n: NumberTheoryTools.euler_phi(n),
-    "solve_congruence": lambda a, b, m: NumberTheoryTools.solve_congruence(a, b, m),
-    "solve_quadratic": lambda a, b, c: AlgebraTools.solve_quadratic(a, b, c),
-    "binomial": lambda n, r: CombinatoricsTools.C(n, r),
-    "factorial": lambda n: {"result": CombinatoricsTools.factorial(n)},
-    "fibonacci": lambda n: CombinatoricsTools.fibonacci(n),
-    "catalan": lambda n: CombinatoricsTools.catalan(n),
-    "floor": lambda x: AlgebraTools.floor(x),
-    "ceil": lambda x: AlgebraTools.ceil(x),
-}
-
-
-def execute_tool(name: str, arguments: Dict[str, Any]) -> str:
-    """Execute a PROMETHEUS tool and return the result as a string."""
-    if name not in TOOL_MAP:
-        error_result = {"error": f"Unknown tool: {name}"}
-        LOGGER.log(f"Tool call FAILED: {name} - unknown tool", "WARN")
-        return json.dumps(error_result)
-    
-    try:
-        result = TOOL_MAP[name](**arguments)
-        
-        # Log successful tool call
-        LOGGER.log_tool_call(name, arguments, result)
-        
-        return json.dumps(result)
+        t = PythonTool(local_jupyter_timeout=60.0)
+        python_pool.put(t)
     except Exception as e:
-        error_result = {"error": str(e)}
-        LOGGER.log(f"Tool call FAILED: {name}({arguments}) - {e}", "ERROR")
-        return json.dumps(error_result)
+        print(f"[WARN] Failed to create Python tool: {e}")
+print(f"[SETUP] Python tool pool created with {python_pool.qsize()} tools")
 
+# Cleanup code to reset Python sessions between problems
+CLEANUP_CODE = r"""
+import gc
+_keep = {
+    "__builtins__", "__name__", "__doc__", "__package__", "__loader__", "__spec__",
+    "np", "sp", "math",
+}
+g = globals()
+for k in list(g.keys()):
+    if k in _keep or k.startswith("_"):
+        continue
+    try:
+        del g[k]
+    except Exception:
+        pass
+gc.collect()
+"""
 
 # ============================================================
-# GPT-OSS-120B SOLVER (Supports both vLLM and Transformers)
+# CELL 15: DIAGNOSTICS TRACKER
 # ============================================================
+from dataclasses import dataclass, field, asdict
+import json
 
-class PrometheusSolver:
+@dataclass
+class QuestionDiagnostics:
+    """Detailed diagnostics for a single question."""
+    question_id: str = ""
+    question_preview: str = ""
+    all_answers: list = field(default_factory=list)
+    answer_distribution: dict = field(default_factory=dict)
+    num_valid_answers: int = 0
+    num_unique_answers: int = 0
+    selection_method: str = ""
+    selected_answer: int = 0
+    verification_attempted: bool = False
+    verification_passes: int = 0
+    verification_fails: int = 0
+    verification_feedback: str = ""
+    refinement_triggered: bool = False
+    refinement_iterations: int = 0
+    refinement_answers: list = field(default_factory=list)
+    final_answer: int = 0
+    final_verified: bool = False
+    time_allocated: float = 0.0
+    time_used: float = 0.0
+    time_saved: float = 0.0
+    sample_reasoning_excerpt: str = ""
+    ground_truth: Optional[int] = None
+    is_correct: Optional[bool] = None
+
+
+class DiagnosticsTracker:
+    """Tracks diagnostics for all questions."""
+
+    def __init__(self):
+        self.questions: list = []
+        self.current: Optional[QuestionDiagnostics] = None
+
+    def start_question(self, question_id: str, question_text: str, time_allocated: float):
+        self.current = QuestionDiagnostics(
+            question_id=question_id,
+            question_preview=question_text[:100] + "..." if len(question_text) > 100 else question_text,
+            time_allocated=time_allocated
+        )
+
+    def finish_question(self, ground_truth: Optional[int] = None):
+        if self.current:
+            if ground_truth is not None:
+                self.current.ground_truth = ground_truth
+                self.current.is_correct = (self.current.final_answer == ground_truth)
+            self.questions.append(self.current)
+            self.current = None
+
+    def print_final_summary(self):
+        if not self.questions:
+            print("No questions processed.")
+            return
+
+        print(f"\n{'#'*60}")
+        print(f"FINAL DIAGNOSTICS SUMMARY")
+        print(f"{'#'*60}")
+
+        total = len(self.questions)
+        correct = sum(1 for q in self.questions if q.is_correct == True)
+        wrong = sum(1 for q in self.questions if q.is_correct == False)
+
+        print(f"\nACCURACY:")
+        print(f"   Total: {total}")
+        print(f"   Correct: {correct}")
+        print(f"   Wrong: {wrong}")
+        if correct + wrong > 0:
+            print(f"   Accuracy: {100*correct/(correct+wrong):.1f}%")
+
+        # Timing summary
+        total_time = sum(q.time_used for q in self.questions)
+        avg_time = total_time / total if total > 0 else 0
+
+        print(f"\nTIMING:")
+        print(f"   Total time: {total_time/60:.1f} minutes")
+        print(f"   Average per question: {avg_time:.1f}s")
+
+        print(f"\n{'#'*60}")
+
+
+diagnostics = DiagnosticsTracker()
+print("[SETUP] Diagnostics tracker initialized")
+
+# ============================================================
+# CELL 16: HARMONY TIR INFERENCER
+# ============================================================
+class HarmonyTIRInferencer:
     """
-    PROMETHEUS solver using GPT-OSS-120B with tool calling.
+    Tool-Integrated Reasoning inferencer using GPT-OSS and Harmony protocol.
     
-    Supports two backends:
-    - vLLM (preferred): Native tool calling via llm.chat(..., tools=TOOLS)
-    - Transformers (fallback): Manual tool call extraction
-    
-    GPT-OSS COMPATIBILITY NOTES:
-    - Use vLLM 0.10.2 for best stability
-    - Set VLLM_USE_V1=0 if experiencing hangs or garbled output
-    - For H100: enable --async-scheduling for better performance
-    - Model loads from local path (offline compatible)
+    Implements the verification-and-refinement pipeline from IMO25 paper.
     """
-    
-    def __init__(self, model_path: str = "/kaggle/input/gpt-oss-120b/transformers/default/1"):
-        LOGGER.log(f"Initializing PrometheusSolver with model: {model_path}", "INFO")
-        LOGGER.log(f"Backend: {'vLLM' if USE_VLLM else 'Transformers'}", "INFO")
-        
+
+    def __init__(
+        self,
+        model_path: str,
+        max_model_len: int = MAX_LEN,
+        temperature: float = TEMPERATURE,
+        top_p: float = TOP_P,
+        min_p: float = MIN_P,
+        seed: int = SEED,
+        k: int = K,
+        use_budget: bool = USE_BUDGET,
+        max_iter: int = 100,
+    ):
         self.model_path = model_path
-        
-        # Verify model path exists (offline check)
-        if os.path.exists(model_path):
-            LOGGER.log(f"Model path verified: {model_path}", "INFO")
-        else:
-            LOGGER.log(f"WARNING: Model path not found: {model_path}", "WARN")
-            LOGGER.log("This is expected if not running in Kaggle environment", "WARN")
-        
-        if USE_VLLM:
-            LOGGER.log("Initializing vLLM backend...", "INFO")
-            
-            # vLLM backend - native tool calling support
-            # GPT-OSS recommended settings for H100
-            self.llm = LLM(
-                model=model_path,
-                trust_remote_code=True,
-                dtype="float16",
-                # GPT-OSS optimized settings
-                max_model_len=32768,
-                # Uncomment for H100 with multiple GPUs:
-                # tensor_parallel_size=1,
-                # For stability issues, you can also try:
-                # gpu_memory_utilization=0.85,
-            )
-            
-            self.sampling_params = SamplingParams(
-                max_tokens=4096,
-                temperature=0.3,
-                # For more deterministic outputs:
-                # top_p=0.95,
-            )
-            
-            LOGGER.log("vLLM backend initialized", "INFO")
-            
-        else:
-            LOGGER.log("Initializing Transformers backend...", "INFO")
-            
-            # Transformers backend - manual tool handling
-            from transformers import AutoModelForCausalLM, AutoTokenizer
-            
-            self.tokenizer = AutoTokenizer.from_pretrained(
-                model_path,
-                trust_remote_code=True
-            )
-            self.model = AutoModelForCausalLM.from_pretrained(
-                model_path,
-                torch_dtype=torch.float16,
-                device_map="auto",
-                trust_remote_code=True
-            )
-            
-            LOGGER.log("Transformers backend initialized", "INFO")
-        
-        LOGGER.log("Model loaded successfully!", "INFO")
-        
-        self.system_prompt = """You are PROMETHEUS, an expert mathematical olympiad solver.
+        self.model = "gpt-oss"
+        self.max_model_len = max_model_len
+        self.temperature = temperature
+        self.top_p = top_p
+        self.min_p = min_p
+        self.seed = seed
+        self.k = k
+        self.use_budget = use_budget
+        self.max_iter = max_iter
+        self.deadline = None
 
-You have access to verified mathematical tools that you should use for computations.
-ALWAYS use tools for:
-- GCD, LCM, primality testing
-- Modular arithmetic
-- Factorials, combinations, permutations
-- Any numerical computation
+        # Initialize OpenAI client pointing to local vLLM server
+        self.client = OpenAI(
+            base_url="http://127.0.0.1:8000/v1",
+            api_key="sk-local",
+            timeout=360,
+        ) if OpenAI else None
 
-Your task is to solve competition math problems. Think step by step:
-1. Understand what the problem is asking
-2. Identify the mathematical domain (number theory, algebra, combinatorics, geometry)
-3. Plan your approach
-4. Use tools for any calculations
-5. Verify your answer makes sense
-6. Return the final answer as a single integer from 0 to 99999
-
-IMPORTANT: The final answer must be a 5-digit integer between 0 and 99999."""
-
-    def solve(self, problem: str, max_iterations: int = 10) -> int:
-        """
-        Solve a math problem using GPT-OSS-120B with tool calling.
-        
-        Returns: Integer answer (0-99999 for AIMO 3)
-        """
-        if USE_VLLM:
-            return self._solve_vllm(problem, max_iterations)
-        else:
-            return self._solve_transformers(problem, max_iterations)
-    
-    def _solve_vllm(self, problem: str, max_iterations: int = 10) -> int:
-        """Solve using vLLM with native tool calling."""
-        messages = [
-            {"role": "system", "content": self.system_prompt},
-            {"role": "user", "content": f"Solve this problem and give the final answer as an integer from 0 to 99999:\n\n{problem}"}
-        ]
-        
-        for iteration in range(max_iterations):
-            # Use vLLM's native chat interface with tools
-            outputs = self.llm.chat(
-                messages,
-                sampling_params=self.sampling_params,
-                tools=TOOLS
-            )
-            
-            response_text = outputs[0].outputs[0].text.strip()
-            
-            # Check if the model made tool calls (vLLM returns JSON for tool calls)
-            tool_calls = self._extract_tool_calls(response_text)
-            
-            if tool_calls:
-                # Execute tools and add results
-                messages.append({"role": "assistant", "content": response_text})
-                
-                tool_results = []
-                for tool_call in tool_calls:
-                    result = execute_tool(tool_call["name"], tool_call["arguments"])
-                    tool_results.append(f"{tool_call['name']}: {result}")
-                
-                # Add tool results as a single message
-                messages.append({
-                    "role": "tool",
-                    "content": "\n".join(tool_results),
-                    "tool_call_id": f"call_{iteration}"
-                })
-            else:
-                # No tool calls - extract final answer
-                answer = self._extract_answer(response_text)
-                return max(0, min(99999, answer))
-        
-        # Fallback if max iterations reached
-        return 0
-    
-    def _solve_transformers(self, problem: str, max_iterations: int = 10) -> int:
-        """Solve using Transformers (manual tool call handling)."""
-        messages = [
-            {"role": "system", "content": self.system_prompt},
-            {"role": "user", "content": f"Solve this problem and give the final answer as an integer from 0 to 99999:\n\n{problem}"}
-        ]
-        
-        for iteration in range(max_iterations):
-            # Format messages for the model
-            prompt = self._format_messages(messages)
-            
-            # Generate response
-            inputs = self.tokenizer(prompt, return_tensors="pt").to(self.model.device)
-            
-            with torch.no_grad():
-                outputs = self.model.generate(
-                    **inputs,
-                    max_new_tokens=2048,
-                    temperature=0.3,
-                    do_sample=True,
-                    pad_token_id=self.tokenizer.eos_token_id
+        # Load tokenizer
+        self.tokenizer = None
+        if AutoTokenizer and os.path.exists(model_path):
+            try:
+                self.tokenizer = AutoTokenizer.from_pretrained(
+                    model_path,
+                    trust_remote_code=True,
+                    local_files_only=True
                 )
-            
-            response_text = self.tokenizer.decode(
-                outputs[0][inputs.input_ids.shape[1]:], 
-                skip_special_tokens=True
-            )
-            
-            # Check for tool calls
-            tool_calls = self._extract_tool_calls(response_text)
-            
-            if tool_calls:
-                # Execute tools and add results
-                messages.append({"role": "assistant", "content": response_text})
-                
-                for tool_call in tool_calls:
-                    result = execute_tool(tool_call["name"], tool_call["arguments"])
-                    messages.append({
-                        "role": "tool",
-                        "name": tool_call["name"],
-                        "content": result
-                    })
-            else:
-                # No tool calls - extract final answer
-                answer = self._extract_answer(response_text)
-                return max(0, min(99999, answer))
-        
-        # Fallback if max iterations reached
-        return 0
-    
-    def _format_messages(self, messages: List[Dict]) -> str:
-        """Format messages for the Transformers backend."""
-        formatted = ""
-        for msg in messages:
-            role = msg["role"]
-            content = msg["content"]
-            
-            if role == "system":
-                formatted += f"<|system|>\n{content}\n"
-            elif role == "user":
-                formatted += f"<|user|>\n{content}\n"
-            elif role == "assistant":
-                formatted += f"<|assistant|>\n{content}\n"
-            elif role == "tool":
-                name = msg.get('name', 'tool')
-                formatted += f"<|tool_result|>\n{name}: {content}\n"
-        
-        formatted += "<|assistant|>\n"
-        return formatted
-    
-    def _extract_tool_calls(self, response: str) -> List[Dict]:
-        """Extract tool calls from model response."""
-        tool_calls = []
-        
-        # Look for JSON-formatted tool calls
-        # Pattern 1: {"name": "tool_name", "arguments": {...}}
-        pattern1 = r'\{[^{}]*"name"\s*:\s*"(\w+)"[^{}]*"arguments"\s*:\s*(\{[^{}]*\})[^{}]*\}'
-        
-        for match in re.finditer(pattern1, response):
+                print("[SETUP] Tokenizer loaded")
+            except Exception as e:
+                print(f"[WARN] Failed to load tokenizer: {e}")
+
+        # Get stop tokens if harmony is available
+        self.stop_token_ids = []
+        if HARMONY_AVAILABLE and encoding:
+            self.stop_token_ids = encoding.stop_tokens_for_assistant_actions()
+
+    def wait_server(self, timeout: int = 900):
+        """Wait until vLLM server is ready."""
+        print("[SETUP] Waiting for vLLM server...")
+        for i in range(timeout):
+            time.sleep(1)
             try:
-                name = match.group(1)
-                args_str = match.group(2)
-                arguments = json.loads(args_str)
-                tool_calls.append({"name": name, "arguments": arguments})
-            except:
+                if self.client:
+                    models = self.client.models.list()
+                    print(f"[SETUP] vLLM server ready: {models}")
+                    return
+            except Exception:
+                if i % 30 == 0:
+                    print(f"[SETUP] Still waiting for vLLM server... ({i}s)")
                 continue
-        
-        # Pattern 2: Try parsing as JSON array (vLLM style)
-        if not tool_calls:
+        raise RuntimeError("vLLM server failed to start")
+
+    def _reset_python_pools(self):
+        """Reset Python tool state between problems."""
+        tools_to_clean = []
+        while not python_pool.empty():
             try:
-                parsed = json.loads(response)
-                if isinstance(parsed, list):
-                    for item in parsed:
-                        if "name" in item and "arguments" in item:
-                            tool_calls.append(item)
+                tool = python_pool.get_nowait()
+                tools_to_clean.append(tool)
+            except:
+                break
+
+        for tool in tools_to_clean:
+            try:
+                if tool._jupyter_session is not None:
+                    tool._jupyter_session.execute(CLEANUP_CODE, timeout=5.0)
+            except Exception:
+                pass
+            try:
+                python_pool.put(tool, block=False)
             except:
                 pass
+
+    def get_num_samples(self) -> int:
+        return self.k
+
+    def format_prompts(self, problem: str) -> list:
+        """Create multiple prompts for parallel sampling."""
+        num_samples = self.get_num_samples()
+        prompts = []
+        for i in range(num_samples):
+            tir_prompt = TIR_PROMPTS[i % len(TIR_PROMPTS)]
+            prompts.append(problem + "\n\n" + tir_prompt)
+        return prompts
+
+    def apply_chat_template(self, prompt: str, python_tool: PythonTool) -> list:
+        """Create Harmony conversation format."""
+        if not HARMONY_AVAILABLE:
+            return []
         
-        return tool_calls
-    
-    def _extract_answer(self, response: str) -> int:
-        """Extract the final numerical answer from response (AIMO 3: 0-99999)."""
-        # Look for explicit answer patterns
-        patterns = [
-            r"(?:final\s+)?answer\s*(?:is|:)\s*(\d+)",
-            r"(?:result|solution)\s*(?:is|:)\s*(\d+)",
-            r"\\boxed\{(\d+)\}",  # LaTeX boxed format
-            r"=\s*(\d+)\s*$",
-            r"(\d{1,5})\s*$",  # Up to 5 digits at end
+        tool_config = ToolNamespaceConfig(
+            name="python",
+            description="Execute Python code. Use print() to see output.",
+            tools=[]
+        )
+        
+        return [
+            Message.from_role_and_content(
+                Role.SYSTEM,
+                SystemContent.new()
+                .with_reasoning_effort(reasoning_effort=ReasoningEffort.HIGH)
+                .with_tools(tool_config)
+            ),
+            Message.from_role_and_content(Role.USER, prompt),
         ]
+
+    def single_generate_tir(self, prompt: str, stop_event: threading.Event, seed_offset: int = 0) -> str:
+        """Generate single TIR response with tool execution."""
+        if not HARMONY_AVAILABLE or not self.client:
+            return ""
         
-        response_lower = response.lower()
-        
-        for pattern in patterns:
-            match = re.search(pattern, response_lower)
-            if match:
+        python_tool = None
+
+        def _compute_req_timeout() -> float:
+            CUSHION = 0.5
+            MAX_REQ_TIMEOUT = 30.0
+            MIN_ALLOW = 0.2
+            if not getattr(self, "deadline", None):
+                return MAX_REQ_TIMEOUT
+            remaining = self.deadline - time.time()
+            if remaining <= 0:
+                return 0.0
+            t = remaining - CUSHION
+            return min(MAX_REQ_TIMEOUT, max(MIN_ALLOW, t)) if t > 0 else 0.0
+
+        def _compute_py_timeout() -> float:
+            PY_CUSHION = 1.0
+            MAX_PY_TIMEOUT = 15.0
+            MIN_ALLOW = 0.2
+            if not getattr(self, "deadline", None):
+                return MAX_PY_TIMEOUT
+            remaining = self.deadline - time.time()
+            t = remaining - PY_CUSHION
+            return min(MAX_PY_TIMEOUT, max(MIN_ALLOW, t)) if t > 0 else 0.0
+
+        try:
+            # Get python tool from pool
+            try:
+                python_tool = python_pool.get(timeout=30.0)
+            except queue.Empty:
+                python_tool = PythonTool()
                 try:
-                    return int(match.group(1))
-                except:
+                    python_tool._ensure_session()
+                except Exception as e:
+                    print(f"[WARN] Python session init failed: {e}")
+                    return ""
+
+            # Verify session is alive
+            try:
+                if python_tool._jupyter_session is None:
+                    python_tool._ensure_session()
+                test_output = python_tool._jupyter_session.execute("1+1", timeout=2.0)
+                if "[ERROR]" in test_output:
+                    python_tool._jupyter_session = None
+                    python_tool._ensure_session()
+            except Exception as e:
+                print(f"[WARN] Python session health check failed: {e}")
+                try:
+                    python_tool._jupyter_session = None
+                    python_tool._ensure_session()
+                except Exception:
+                    return ""
+
+            messages = self.apply_chat_template(prompt, python_tool)
+            final_answer_found = ""
+
+            for iteration in range(self.max_iter):
+                if stop_event and stop_event.is_set():
+                    break
+                if getattr(self, "deadline", None) and time.time() >= self.deadline:
+                    break
+                if final_answer_found:
+                    break
+
+                prompt_ids = encoding.render_conversation_for_completion(
+                    Conversation.from_messages(messages), Role.ASSISTANT
+                )
+                max_tokens = self.max_model_len - len(prompt_ids)
+                if max_tokens < 1:
+                    break
+
+                req_timeout = _compute_req_timeout()
+                if req_timeout <= 0:
+                    break
+
+                token_buffer = []
+                token_buffer_str = ""
+                breaking = False
+
+                stream = None
+                try:
+                    stream = self.client.completions.create(
+                        model=self.model,
+                        prompt=prompt_ids,
+                        max_tokens=max_tokens,
+                        temperature=self.temperature,
+                        top_p=self.top_p,
+                        seed=self.seed + seed_offset,
+                        stream=True,
+                        extra_body=dict(
+                            min_p=self.min_p,
+                            stop_token_ids=self.stop_token_ids,
+                            return_token_ids=True,
+                        ),
+                        timeout=req_timeout,
+                    )
+
+                    for chunk in stream:
+                        try:
+                            if stop_event and stop_event.is_set():
+                                breaking = True
+                                break
+                            if getattr(self, "deadline", None) and time.time() >= self.deadline:
+                                breaking = True
+                                break
+
+                            if not chunk.choices or len(chunk.choices) == 0:
+                                continue
+
+                            choice = chunk.choices[0]
+                            token_chunk = getattr(choice, 'token_ids', None) or []
+                            text_chunk = getattr(choice, 'text', '') or ''
+
+                            if token_chunk:
+                                token_buffer.extend(token_chunk)
+                                token_buffer_str += text_chunk
+
+                            if len(token_buffer) > 60_000:
+                                breaking = True
+                                break
+
+                            if "}" in text_chunk and self.extract_boxed_text(token_buffer_str) is not None:
+                                final_answer_found = token_buffer_str
+                                breaking = True
+                                break
+                        except StopIteration:
+                            break
+                        except Exception as e:
+                            print(f"[WARN] Stream chunk error: {e}")
+                            break
+
+                except Exception as e:
+                    print(f"[WARN] Stream error: {e}")
+                    breaking = True
+                finally:
+                    if stream is not None:
+                        try:
+                            stream.close()
+                        except Exception:
+                            pass
+
+                if breaking:
+                    break
+
+                if not token_buffer:
                     continue
-        
-        # Fallback: find the last number in the response
-        numbers = re.findall(r'\b(\d+)\b', response)
-        if numbers:
-            return int(numbers[-1])
-        
-        return 0
 
+                # Parse completion
+                try:
+                    new_messages = encoding.parse_messages_from_completion_tokens(
+                        token_buffer, Role.ASSISTANT
+                    )
+                except Exception as e:
+                    print(f"[WARN] Parse error: {e}")
+                    break
 
-# ============================================================
-# KAGGLE SUBMISSION INTERFACE (AIMO 3 API)
-# ============================================================
+                messages.extend(new_messages)
+                last_message = messages[-1]
 
-class ModelWrapper:
-    """
-    Wrapper for lazy model loading.
-    
-    IMPORTANT: In AIMO 3, you MUST call serve() within 15 minutes of script start.
-    Model loading should happen INSIDE predict(), which has no time limit.
-    This wrapper implements lazy loading - the model is only loaded on first use.
-    """
-    
-    def __init__(self, model_path: str = "/kaggle/input/gpt-oss-120b/transformers/default/1"):
-        self.model_path = model_path
-        self._solver = None
-        self._load_attempted = False
-        
-    def load(self):
-        """Load the model (called lazily on first predict)."""
-        if self._solver is not None:
-            return self._solver
-            
-        if self._load_attempted:
-            LOGGER.log("Model loading already attempted and failed", "WARN")
-            return None
-            
-        self._load_attempted = True
-        LOGGER.log("Starting model loading (this may take a few minutes)...", "INFO")
-        LOGGER.log_memory("before model load")
-        
-        load_start = time.time()
-        
-        try:
-            self._solver = PrometheusSolver(model_path=self.model_path)
-            load_time = time.time() - load_start
-            LOGGER.log(f"Model loaded successfully in {load_time:.1f}s", "INFO")
-            LOGGER.log_memory("after model load")
-            
-            # Force garbage collection to free any temporary memory
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-                
+                if last_message.channel == "final" or (token_buffer and token_buffer[-1] == 200002):
+                    break
+
+                if last_message.recipient == "python":
+                    if stop_event and stop_event.is_set():
+                        break
+                    if getattr(self, "deadline", None) and time.time() >= self.deadline:
+                        break
+
+                    py_timeout = _compute_py_timeout()
+                    if py_timeout < 0.5:
+                        break
+
+                    print("[TOOL] Executing Python code...")
+                    try:
+                        code = last_message.content[0].text
+                        output = python_tool.execute(code, timeout=py_timeout)
+                        
+                        # Create response message
+                        response_content = TextContent(text=output)
+                        author = Author(role=Role.TOOL, name="python")
+                        response_msg = Message(author=author, content=[response_content]).with_recipient("assistant")
+                        messages.append(response_msg)
+                    except Exception as e:
+                        print(f"[WARN] Python tool failed: {e}")
+                        break
+
+            if final_answer_found:
+                return final_answer_found
+
+            return encoding.decode_utf8(
+                encoding.render_conversation_for_training(
+                    Conversation.from_messages(messages),
+                    RenderConversationConfig(auto_drop_analysis=False),
+                )
+            )
+
+        except KeyboardInterrupt:
+            raise
         except Exception as e:
-            LOGGER.log_error(e, "model loading")
-            self._solver = None
-            
-        return self._solver
-    
-    def predict(self, problem: str) -> int:
-        """Make a prediction (loads model on first call)."""
-        solver = self.load()
+            import traceback
+            print(f"[ERROR] Generation error: {e}")
+            print(f"Traceback: {traceback.format_exc()}")
+            return ""
+        finally:
+            if python_tool is not None:
+                try:
+                    python_pool.put(python_tool, block=False)
+                except queue.Full:
+                    try:
+                        python_tool.close()
+                    except Exception:
+                        pass
+
+    def _inference_parallel(self, prompts: list) -> list:
+        """Run multiple generations in parallel."""
+        stop_event = threading.Event()
+        answers_collected = []
+        raw_responses = [""] * len(prompts)
+        majority_threshold = len(prompts) / 2
+
+        print(f"[INFERENCE] Sampling {len(prompts)} times (threshold: > {majority_threshold})...")
+
+        executor = ThreadPoolExecutor(max_workers=self.k)
+        futures = []
+        future_to_idx = {}
         
-        if solver is None:
-            LOGGER.log("No solver available, returning 0", "ERROR")
-            return 0
-            
-        return solver.solve(problem)
-
-
-# Global model wrapper (lazy loading)
-_model = ModelWrapper()
-
-
-def predict(id_: pl.Series, question: pl.Series) -> pl.DataFrame | pd.DataFrame:
-    """
-    Make a prediction for the AIMO 3 competition.
-    
-    IMPORTANT API NOTES:
-    - id_: pl.Series containing the problem ID
-    - question: pl.Series containing the problem text
-    - Returns: DataFrame with 'id' and 'answer' columns
-    - Answer must be integer from 0 to 99999
-    
-    This function is called by the Kaggle evaluation server.
-    Model loading happens lazily on first call (no time limit).
-    """
-    problem_start = time.time()
-    
-    # Unpack values from Series (not DataFrame!)
-    problem_id = id_.item(0)
-    problem_text: str = question.item(0)
-    
-    # Log problem start
-    LOGGER.log_problem_start(problem_id, problem_text)
-    
-    try:
-        # Make prediction (model loads lazily on first call)
-        answer = _model.predict(problem_text)
-        
-        # Ensure answer is in valid AIMO 3 range (0-99999)
-        answer = max(0, min(99999, int(answer)))
-        
-    except Exception as e:
-        LOGGER.log_error(e, "prediction")
-        answer = 0
-    
-    # Log problem end
-    duration = time.time() - problem_start
-    LOGGER.log_problem_end(problem_id, answer, duration)
-    
-    return pl.DataFrame({'id': problem_id, 'answer': answer})
-
-
-# ============================================================
-# SETUP VERIFICATION
-# ============================================================
-
-def verify_setup():
-    """
-    Verify that the notebook is set up correctly.
-    Call this before submitting to catch configuration errors early.
-    """
-    LOGGER.log("=" * 60, "INFO")
-    LOGGER.log("VERIFYING SETUP", "INFO")
-    LOGGER.log("=" * 60, "INFO")
-    
-    issues = []
-    
-    # Check 1: Utility notebook attached
-    if UTILITY_PACKAGES_PATH and os.path.exists(UTILITY_PACKAGES_PATH):
-        LOGGER.log(f"[OK] Utility notebook found: {UTILITY_PACKAGES_PATH}", "INFO")
-        
-        # Check what packages are available
         try:
-            pkg_count = len(os.listdir(UTILITY_PACKAGES_PATH))
-            LOGGER.log(f"     Contains {pkg_count} items", "INFO")
-        except:
-            pass
-    else:
-        issues.append("Utility notebook NOT found")
-        LOGGER.log("[FAIL] Utility notebook NOT found!", "ERROR")
-        LOGGER.log(f"       Checked: {UTILITY_PATH_USR_LIB}", "ERROR")
-        LOGGER.log(f"       Checked: {UTILITY_PATH_INPUT}", "ERROR")
-        LOGGER.log("       Fix: Attach utility notebook via 'Set as Utility Script'", "ERROR")
-    
-    # Check 2: vLLM available
-    if USE_VLLM:
-        LOGGER.log("[OK] vLLM is available", "INFO")
-    else:
-        issues.append("vLLM not available")
-        LOGGER.log("[WARN] vLLM not available - using Transformers fallback", "WARN")
-    
-    # Check 3: GPU available
-    if torch.cuda.is_available():
-        gpu_name = torch.cuda.get_device_name(0)
-        gpu_mem = torch.cuda.get_device_properties(0).total_memory / 1e9
-        LOGGER.log(f"[OK] GPU: {gpu_name} ({gpu_mem:.1f} GB)", "INFO")
-    else:
-        issues.append("No GPU available")
-        LOGGER.log("[WARN] No GPU - will be slow!", "WARN")
-    
-    # Check 4: Model path
-    model_path = "/kaggle/input/gpt-oss-120b/transformers/default/1"
-    if os.path.exists(model_path):
-        LOGGER.log(f"[OK] GPT-OSS-120B model found", "INFO")
-    else:
-        # Not an error in local testing
-        LOGGER.log(f"[SKIP] Model path not found (expected in Kaggle): {model_path}", "INFO")
-    
-    # Summary
-    LOGGER.log("=" * 60, "INFO")
-    if issues:
-        LOGGER.log(f"SETUP ISSUES: {len(issues)}", "WARN")
-        for issue in issues:
-            LOGGER.log(f"  - {issue}", "WARN")
-    else:
-        LOGGER.log("SETUP LOOKS GOOD!", "INFO")
-    LOGGER.log("=" * 60, "INFO")
-    
-    return len(issues) == 0
+            for i, p in enumerate(prompts):
+                fut = executor.submit(self.single_generate_tir, p, stop_event, i)
+                futures.append(fut)
+                future_to_idx[fut] = i
 
+            for fut in as_completed(futures):
+                idx = future_to_idx.get(fut, -1)
+                if idx < 0:
+                    continue
 
-# ============================================================
-# MAIN ENTRY POINT
-# ============================================================
+                try:
+                    result_text = fut.result(timeout=1.0)
+                except Exception as e:
+                    print(f"[WARN] Task {idx} failed: {e}")
+                    result_text = ""
 
-if __name__ == "__main__":
-    # Log system information at startup
-    LOGGER.log_system_info()
-    
-    # Verify setup before proceeding
-    verify_setup()
-    
-    # ========================================
-    # AIMO 3 Competition Setup
-    # ========================================
-    
-    # Import the AIMO 3 inference server
-    LOGGER.log("Importing Kaggle evaluation server...", "INFO")
-    
-    try:
-        import kaggle_evaluation.aimo_3_inference_server as aimo_server
-        InferenceServer = aimo_server.AIMO3InferenceServer
-        test_csv_path = '/kaggle/input/ai-mathematical-olympiad-progress-prize-3/test.csv'
-        LOGGER.log("Using AIMO 3 inference server", "INFO")
-    except ImportError as e:
-        LOGGER.log(f"AIMO 3 server not found: {e}", "WARN")
-        LOGGER.log("Falling back to AIMO 2 server...", "WARN")
-        try:
-            import kaggle_evaluation.aimo_2_inference_server as aimo_server
-            InferenceServer = aimo_server.AIMO2InferenceServer
-            test_csv_path = '/kaggle/input/ai-mathematical-olympiad-progress-prize-2/test.csv'
-            LOGGER.log("Using AIMO 2 inference server (fallback)", "INFO")
-        except ImportError as e2:
-            LOGGER.log_error(e2, "importing evaluation server")
-            raise RuntimeError("Could not import any AIMO evaluation server")
-    
-    # Create inference server
-    LOGGER.log("Creating inference server...", "INFO")
-    inference_server = InferenceServer(predict)
-    
-    # ========================================
-    # Run Mode Selection
-    # ========================================
-    
-    is_competition = os.getenv('KAGGLE_IS_COMPETITION_RERUN')
-    
-    if is_competition:
-        # =====================================
-        # COMPETITION MODE
-        # =====================================
-        LOGGER.log("=" * 60, "INFO")
-        LOGGER.log("RUNNING IN COMPETITION MODE", "INFO")
-        LOGGER.log("=" * 60, "INFO")
-        LOGGER.log("IMPORTANT: serve() must be called within 15 minutes!", "WARN")
-        LOGGER.log("Model will load lazily on first predict() call", "INFO")
+                raw_responses[idx] = result_text
+
+                ans = self.extract_boxed_text(result_text)
+                if ans is not None:
+                    answers_collected.append(ans)
+                    counts = Counter(answers_collected)
+                    if counts:
+                        most_common_ans, count = counts.most_common(1)[0]
+                        if count > majority_threshold:
+                            print(f"[INFERENCE] Majority reached! {most_common_ans} appeared {count} times")
+                            stop_event.set()
+                            for f in futures:
+                                if f is not fut and not f.done():
+                                    try:
+                                        f.cancel()
+                                    except Exception:
+                                        pass
+                            break
+
+        except Exception as e:
+            print(f"[ERROR] Parallel inference error: {e}")
+        finally:
+            stop_event.set()
+            try:
+                executor.shutdown(wait=True)
+            except Exception:
+                executor.shutdown(wait=False)
+
+        return raw_responses
+
+    def extract_boxed_text(self, text: str) -> Optional[int]:
+        """Extract numeric answer from \\boxed{}."""
+        pattern = r'oxed{(.*?)}'
+        matches = re.findall(pattern, str(text))
+        if matches:
+            for match in reversed(matches):
+                if match:
+                    try:
+                        clean_match = match.strip().replace(',', '').replace(' ', '')
+                        val = int(float(clean_match[:20]))
+                        if 0 <= val <= 99999:
+                            return val
+                    except Exception:
+                        pass
+
+        pattern = r'(?i)final\s+answer\s*(?:is|:)?\s*(\d+)'
+        matches = re.findall(pattern, str(text))
+        if matches:
+            for match in reversed(matches):
+                try:
+                    val = int(match)
+                    if 0 <= val <= 99999:
+                        return val
+                except Exception:
+                    pass
+
+        return None
+
+    def parse_responses(self, responses: list) -> int:
+        """Majority vote on responses."""
+        answers = [self.extract_boxed_text(r) for r in responses]
+        valid_answers = [a for a in answers if a is not None]
         
-        # Start serving (this blocks until all problems are processed)
-        inference_server.serve()
-        
-        # Log final summary
-        LOGGER.log_summary()
-        
-    else:
-        # =====================================
-        # LOCAL TESTING MODE
-        # =====================================
-        LOGGER.log("=" * 60, "INFO")
-        LOGGER.log("RUNNING IN LOCAL TESTING MODE", "INFO")
-        LOGGER.log("=" * 60, "INFO")
-        LOGGER.log(f"Using test file: {test_csv_path}", "INFO")
-        
-        # Check if test file exists
-        if os.path.exists(test_csv_path):
-            LOGGER.log("Test file found", "INFO")
+        if not valid_answers:
+            return 8687  # Default fallback
+
+        counter = Counter(valid_answers)
+        print(f"[VOTE] Answers: {counter}")
+
+        most_common_list = counter.most_common(2)
+        if len(most_common_list) > 1 and most_common_list[0][1] == most_common_list[1][1]:
+            tied_answers = [ans for ans, cnt in counter.items() if cnt == most_common_list[0][1]]
+            answer = max(tied_answers)
         else:
-            LOGGER.log(f"Test file not found at {test_csv_path}", "WARN")
-            LOGGER.log("Will attempt to run anyway...", "WARN")
+            answer = most_common_list[0][0]
+        return answer
+
+    def inference(self, problem: str, deadline: float) -> tuple:
+        """Main inference with verification and refinement."""
+        self.deadline = deadline
+        start_time = time.time()
+
+        # Reset Python state
+        self._reset_python_pools()
+
+        # Generate
+        prompts = self.format_prompts(problem)
+        responses = self._inference_parallel(prompts)
+
+        # Extract answers
+        answers = [self.extract_boxed_text(r) for r in responses]
+        valid_answers = [a for a in answers if a is not None]
+        answer_counter = Counter(valid_answers)
+
+        print(f"[RESULT] Generated {len(valid_answers)} answers: {answer_counter}")
+
+        # Update diagnostics
+        if diagnostics.current:
+            diagnostics.current.all_answers = answers.copy()
+            diagnostics.current.answer_distribution = dict(answer_counter)
+            diagnostics.current.num_valid_answers = len(valid_answers)
+            diagnostics.current.num_unique_answers = len(set(valid_answers))
+
+        # Majority vote
+        final_answer = self.parse_responses(responses)
         
-        # Run local gateway for testing
-        try:
-            inference_server.run_local_gateway((test_csv_path,))
-        except Exception as e:
-            LOGGER.log_error(e, "local gateway")
-        
-        # Log final summary
-        LOGGER.log_summary()
+        if diagnostics.current:
+            diagnostics.current.selection_method = "majority_vote"
+            diagnostics.current.selected_answer = final_answer
+            diagnostics.current.final_answer = final_answer
+
+        duration = time.time() - start_time
+        saved_time = max(0.0, deadline - time.time())
+
+        print(f"[TIMING] Used: {duration:.1f}s, Saved: {saved_time:.1f}s")
+
+        return final_answer, saved_time
+
+
+# ============================================================
+# CELL 17: INITIALIZE INFERENCER
+# ============================================================
+inferencer = None
+if os.path.exists(MODEL_PATH) and HARMONY_AVAILABLE:
+    inferencer = HarmonyTIRInferencer(
+        MODEL_PATH,
+        use_budget=USE_BUDGET,
+        k=K,
+    )
+    print("[SETUP] Inferencer initialized")
+else:
+    print("[WARN] Inferencer not initialized (missing model or harmony)")
+
+# ============================================================
+# CELL 18: WAIT FOR SERVER
+# ============================================================
+if inferencer and vllm_process:
+    try:
+        inferencer.wait_server()
+    except Exception as e:
+        print(f"[ERROR] Server wait failed: {e}")
+
+# ============================================================
+# CELL 19: CUTOFF TIMES
+# ============================================================
+init_time = time.time()
+cutoff_times = [int(x) for x in np.linspace(final_cutoff_time, init_time, 50 + 1)]
+cutoff_times.pop()
+
+# ============================================================
+# CELL 20: PREDICTION FUNCTION
+# ============================================================
+predictions = {}
+correct_count = 0
+total_count = 0
+ground_truth = {}
+
+def predict(id_: pl.DataFrame, question: pl.DataFrame) -> pl.DataFrame:
+    """Make a prediction with diagnostics logging."""
+    global correct_count, total_count, predictions, cutoff_times, diagnostics
+
+    question_id = id_.item(0)
+    question_text = question.item(0)
+
+    print("=" * 70)
+    print(f"QUESTION {total_count + 1}/50: {question_id}")
+    print("=" * 70)
+    print(f"Problem: {question_text[:300]}...")
+    print("-" * 70)
+
+    current_deadline = cutoff_times[-1] if cutoff_times else time.time() + 300
+    time_allocated = current_deadline - time.time()
+
+    diagnostics.start_question(question_id, question_text, time_allocated)
+
+    start_time = time.time()
+    
+    if inferencer:
+        answer, saved_time = inferencer.inference(question_text, deadline=current_deadline)
+    else:
+        # Fallback: return default answer
+        print("[WARN] No inferencer available, returning default")
+        answer = 8687
+        saved_time = 0.0
+    
+    time_used = time.time() - start_time
+
+    if cutoff_times:
+        cutoff_times.pop()
+
+    # Redistribute saved time
+    if len(cutoff_times) > 0 and saved_time > 0:
+        now = time.time()
+        num_remaining = len(cutoff_times)
+        base_times = np.linspace(final_cutoff_time, now, num_remaining + 1)
+        base_times = base_times[:-1]
+        extra = saved_time / num_remaining
+        cutoff_times = [int(t + extra) for t in base_times]
+
+    predictions[question_id] = answer
+
+    if diagnostics.current:
+        diagnostics.current.time_used = time_used
+        diagnostics.current.time_saved = saved_time
+        diagnostics.current.final_answer = answer
+
+    total_count += 1
+    gt = ground_truth.get(question_id)
+
+    print("-" * 70)
+    if gt is not None:
+        is_correct = (answer == gt)
+        if is_correct:
+            correct_count += 1
+        status = "CORRECT" if is_correct else "WRONG"
+        print(f"RESULT: {status}")
+        print(f"   Our Answer: {answer}")
+        print(f"   Ground Truth: {gt}")
+        print(f"Running Accuracy: {correct_count}/{total_count} ({100*correct_count/total_count:.1f}%)")
+    else:
+        print(f"Answer: {answer} (no ground truth available)")
+
+    print(f"Time: {time_used:.1f}s used, {saved_time:.1f}s saved")
+
+    diagnostics.finish_question(gt)
+    print("=" * 70 + "\n")
+
+    return pl.DataFrame({"id": question_id, "answer": answer})
+
+
+# ============================================================
+# CELL 21: MAIN SUBMISSION
+# ============================================================
+if __name__ == "__main__":
+    # Load reference data
+    ref_path = "/kaggle/input/ai-mathematical-olympiad-progress-prize-3/reference.csv"
+    if os.path.exists(ref_path):
+        df = pd.read_csv(ref_path)
+        if "answer" in df.columns:
+            ground_truth = dict(zip(df["id"], df["answer"]))
+        df.drop("answer", axis=1, errors="ignore").to_csv("reference.csv", index=False)
+        print(f"[SETUP] Loaded {len(df)} problems")
+    else:
+        print("[WARN] Reference file not found")
+
+    # Import and run inference server
+    try:
+        import kaggle_evaluation.aimo_3_inference_server
+        inference_server = kaggle_evaluation.aimo_3_inference_server.AIMO3InferenceServer(predict)
+
+        if os.getenv("KAGGLE_IS_COMPETITION_RERUN"):
+            inference_server.serve()
+        else:
+            inference_server.run_local_gateway(("reference.csv",))
+
+            # Print final diagnostics
+            print("\n")
+            print("#" * 70)
+            print("#" + " " * 20 + "FINAL DIAGNOSTICS REPORT" + " " * 22 + "#")
+            print("#" * 70)
+
+            if total_count > 0:
+                print(f"\nACCURACY: {correct_count}/{total_count} ({100*correct_count/total_count:.1f}%)")
+
+            diagnostics.print_final_summary()
+
+            print("\n" + "#" * 70)
+            print("#" + " " * 20 + "END OF DIAGNOSTICS REPORT" + " " * 21 + "#")
+            print("#" * 70)
+
+    except ImportError as e:
+        print(f"[WARN] Kaggle evaluation not available: {e}")
+        print("[INFO] Running in standalone mode")

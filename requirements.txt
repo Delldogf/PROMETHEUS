@@ -1,33 +1,64 @@
 # PROMETHEUS Dependencies
-# Proof-Reasoning and Olympiad Mathematical Engine
+# Proof-Reasoning and Olympiad Mathematical Engine for AIMO 3
 
-# Core
-python-dotenv>=1.0.0          # Environment variable management
+# ============================================================
+# KAGGLE COMPETITION REQUIREMENTS
+# These are the key packages for the AIMO 3 submission
+# ============================================================
 
-# LLM Integration
-openai>=1.0.0                  # OpenAI API (or compatible)
-anthropic>=0.18.0              # Anthropic Claude API
-transformers>=4.36.0           # For local models
-torch>=2.0.0                   # PyTorch for neural components
+# LLM Inference
+vllm>=0.6.0                    # Fast LLM inference engine (run as server)
+openai>=1.0.0                  # OpenAI API client (for vLLM server communication)
+openai-harmony                 # GPT-OSS tool calling protocol (OpenAI's official package)
+transformers>=4.36.0           # HuggingFace transformers (for tokenizer)
+torch>=2.0.0                   # PyTorch
 
-# Symbolic Math
+# Python Tool Execution
+jupyter_client>=8.0.0          # Jupyter kernel for stateful code execution
+ipykernel>=6.0.0               # IPython kernel
+
+# Data Processing
+numpy>=1.24.0                  # Numerical operations
+pandas>=2.0.0                  # Data manipulation
+polars>=0.20.0                 # Fast DataFrame library (used by Kaggle)
+
+# ============================================================
+# SYMBOLIC MATH (PROMETHEUS ENGINES)
+# ============================================================
 sympy>=1.12                    # Symbolic mathematics
 z3-solver>=4.12.0              # SMT solver for logical reasoning
-numpy>=1.24.0                  # Numerical operations
-
-# Search & Optimization
 scipy>=1.11.0                  # Scientific computing
 
-# Data & Utilities
+# ============================================================
+# UTILITIES
+# ============================================================
+python-dotenv>=1.0.0           # Environment variable management
 pydantic>=2.0.0                # Data validation and settings
 typing-extensions>=4.8.0       # Extended typing support
 rich>=13.0.0                   # Beautiful terminal output
 tqdm>=4.66.0                   # Progress bars
 
-# Testing
+# ============================================================
+# DEVELOPMENT & TESTING
+# ============================================================
 pytest>=7.4.0                  # Testing framework
 pytest-asyncio>=0.21.0         # Async test support
-
-# Development
 black>=23.0.0                  # Code formatting
 mypy>=1.5.0                    # Type checking
+
+# ============================================================
+# NOTES FOR KAGGLE UTILITY NOTEBOOK
+# ============================================================
+# When creating a utility notebook, install these packages:
+#
+# !pip install --target=/kaggle/working \
+#     openai \
+#     openai-harmony \
+#     transformers \
+#     vllm \
+#     jupyter_client \
+#     ipykernel \
+#     polars
+#
+# The submission notebook will add /kaggle/working to sys.path
+# to use these locally installed packages.
