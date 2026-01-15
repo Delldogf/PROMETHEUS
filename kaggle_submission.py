@@ -164,10 +164,33 @@ os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 # Set tiktoken encodings path if available
-TIKTOKEN_PATH = "/kaggle/usr/lib/pip_install_aimo3_1/tiktoken_encodings"
-if os.path.exists(TIKTOKEN_PATH):
+# Check multiple possible locations (different utility notebooks)
+TIKTOKEN_PATHS = [
+    "/kaggle/usr/lib/pip_install_aimo3_1/tiktoken_encodings",
+    "/kaggle/usr/lib/aimo3_utility_notebook_dependency_install_1_2/tiktoken_encodings",
+    "/kaggle/usr/lib/aimo3_utility_notebook_dependency_install_1_2",  # encodings might be in root
+    "/kaggle/input/tiktoken-encodings",  # if uploaded as dataset
+    "/kaggle/working/tiktoken_encodings",
+]
+TIKTOKEN_PATH = None
+for path in TIKTOKEN_PATHS:
+    if os.path.exists(path):
+        # Check if it contains tiktoken files
+        if os.path.isdir(path):
+            files = os.listdir(path)
+            if any(f.endswith('.tiktoken') for f in files):
+                TIKTOKEN_PATH = path
+                break
+            # Check for o200k_base.tiktoken specifically (needed for GPT-OSS)
+            if 'o200k_base.tiktoken' in files:
+                TIKTOKEN_PATH = path
+                break
+                
+if TIKTOKEN_PATH:
     os.environ["TIKTOKEN_ENCODINGS_BASE"] = TIKTOKEN_PATH
     print(f"[SETUP] Set TIKTOKEN_ENCODINGS_BASE to {TIKTOKEN_PATH}")
+else:
+    print("[WARN] Tiktoken encodings not found - Harmony may fail to load")
 
 # ============================================================
 # CELL 8: PYTHON TOOL WITH JUPYTER KERNEL
@@ -685,11 +708,19 @@ try:
         TextContent,
         ToolNamespaceConfig,
     )
+    print("[SETUP] OpenAI Harmony module imported, loading encoding...")
     encoding = load_harmony_encoding(HarmonyEncodingName.HARMONY_GPT_OSS)
     HARMONY_AVAILABLE = True
-    print("[SETUP] OpenAI Harmony imported")
+    print("[SETUP] OpenAI Harmony encoding loaded successfully")
 except ImportError as e:
-    print(f"[WARN] OpenAI Harmony not available: {e}")
+    print(f"[WARN] OpenAI Harmony import failed: {e}")
+    HARMONY_AVAILABLE = False
+    encoding = None
+except Exception as e:
+    # Catch HarmonyError and other exceptions (e.g., vocab file download failure)
+    print(f"[WARN] OpenAI Harmony encoding failed to load: {e}")
+    print("[INFO] This usually means tiktoken vocab files are missing.")
+    print("[INFO] Make sure your utility notebook includes tiktoken encodings.")
     HARMONY_AVAILABLE = False
     encoding = None
 
