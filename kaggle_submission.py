@@ -49,63 +49,75 @@ REQUIRED KAGGLE INPUTS:
 """
 
 # ============================================================
-# STEP 1: ADD UTILITY NOTEBOOK PATH (MUST BE BEFORE ALL IMPORTS!)
+# STEP 1: ENVIRONMENT VARIABLES (MUST BE BEFORE ALL IMPORTS!)
 # ============================================================
-# This is the critical step that makes the utility notebook system work.
-# The utility notebook pre-installed packages to /kaggle/working,
-# which becomes /kaggle/input/<notebook-name>/ when attached.
+# CRITICAL: These must be set BEFORE importing transformers/vllm!
+# They prevent the cascade: transformers → tensorflow → keras → sklearn → numpy error
 
 import os
 import sys
 
-# ==========================================================
-# CONFIGURE THIS: Set to YOUR utility notebook's name
-# ==========================================================
-# When you copy/fork the utility notebook, update this to match.
-# The name is the last part of the URL, e.g.:
-#   URL: kaggle.com/code/yourusername/my-aimo3-utility
-#   NAME: "my-aimo3-utility"
+# Prevent transformers from importing tensorflow/flax (causes numpy conflicts)
+os.environ['TRANSFORMERS_NO_TF'] = '1'
+os.environ['TRANSFORMERS_NO_FLAX'] = '1'
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 
-UTILITY_NOTEBOOK_NAME = "aimo3-utility-notebook-dependency-install-1-2"  # Default (Simon Frieder's)
-
-# Alternative popular utility notebooks you might use:
-# UTILITY_NOTEBOOK_NAME = "pip-install-aimo3-1"  # AI-Cat's version
-# UTILITY_NOTEBOOK_NAME = "pip-install-aimo3-1-gpt-oss-vllm-0.12.0"  # GPT-OSS specific
-
-# Build the path where the utility notebook's packages are located
-UTILITY_PACKAGES_PATH = f"/kaggle/input/{UTILITY_NOTEBOOK_NAME}"
-
-# Add to Python's import path FIRST (before any other imports)
-if os.path.exists(UTILITY_PACKAGES_PATH):
-    # Insert at position 0 so these packages take priority
-    sys.path.insert(0, UTILITY_PACKAGES_PATH)
-    print(f"[SETUP] Added utility notebook to path: {UTILITY_PACKAGES_PATH}")
-    
-    # List what's available (for debugging)
-    try:
-        contents = os.listdir(UTILITY_PACKAGES_PATH)[:10]
-        print(f"[SETUP] Utility notebook contents: {contents}...")
-    except:
-        pass
-else:
-    print(f"[SETUP] WARNING: Utility notebook not found at {UTILITY_PACKAGES_PATH}")
-    print("[SETUP] Make sure you attached your utility notebook as an input!")
-    print("[SETUP] Click 'Add Input' in Kaggle and select your utility notebook")
-
-# Also try the working directory (in case running the utility notebook itself)
-if os.path.exists("/kaggle/working") and "/kaggle/working" not in sys.path:
-    sys.path.insert(0, "/kaggle/working")
-
-# ============================================================
-# STEP 2: ENVIRONMENT VARIABLES (before other imports)
-# ============================================================
-# These help avoid any remaining conflicts
-
+# Other helpful settings
 os.environ['TOKENIZERS_PARALLELISM'] = 'false'   # Avoid tokenizer warnings
 os.environ['CUDA_VISIBLE_DEVICES'] = '0'         # Use first GPU
 
 # For vLLM stability with GPT-OSS (use v0 engine, not v1)
 os.environ['VLLM_USE_V1'] = '0'
+
+# ============================================================
+# STEP 2: ADD UTILITY NOTEBOOK PATH
+# ============================================================
+# Utility notebooks can be attached in TWO ways with DIFFERENT paths:
+#
+# Method 1: "Set as Utility Script" (File menu)
+#   → Path: /kaggle/usr/lib/<notebook-name-with-underscores>/
+#
+# Method 2: "Add Input" (regular data attachment)  
+#   → Path: /kaggle/input/<notebook-name-with-dashes>/
+#
+# We check BOTH locations!
+
+# ==========================================================
+# CONFIGURE THIS: Set to YOUR utility notebook's name
+# ==========================================================
+UTILITY_NOTEBOOK_NAME = "aimo3-utility-notebook-dependency-install-1-2"
+
+# Convert dashes to underscores for the /usr/lib path
+UTILITY_NAME_UNDERSCORES = UTILITY_NOTEBOOK_NAME.replace("-", "_")
+
+# Both possible paths
+UTILITY_PATH_USR_LIB = f"/kaggle/usr/lib/{UTILITY_NAME_UNDERSCORES}"  # "Set as Utility Script"
+UTILITY_PATH_INPUT = f"/kaggle/input/{UTILITY_NOTEBOOK_NAME}"         # "Add Input"
+
+# Try to find and add the utility notebook
+UTILITY_PACKAGES_PATH = None
+
+for path in [UTILITY_PATH_USR_LIB, UTILITY_PATH_INPUT, "/kaggle/working"]:
+    if os.path.exists(path):
+        sys.path.insert(0, path)
+        UTILITY_PACKAGES_PATH = path
+        print(f"[SETUP] Added utility notebook to path: {path}")
+        
+        # List what's available (for debugging)
+        try:
+            contents = os.listdir(path)[:10]
+            print(f"[SETUP] Contains: {contents}...")
+        except:
+            pass
+        break
+
+if UTILITY_PACKAGES_PATH is None:
+    print(f"[SETUP] WARNING: Utility notebook not found!")
+    print(f"[SETUP] Checked: {UTILITY_PATH_USR_LIB}")
+    print(f"[SETUP] Checked: {UTILITY_PATH_INPUT}")
+    print("[SETUP] Make sure you attached your utility notebook:")
+    print("[SETUP]   Option 1: File → Set as Utility Script")
+    print("[SETUP]   Option 2: Add Input → select your utility notebook")
 
 # ============================================================
 # STEP 3: NOW SAFE TO IMPORT EVERYTHING
@@ -1240,7 +1252,7 @@ def verify_setup():
     issues = []
     
     # Check 1: Utility notebook attached
-    if os.path.exists(UTILITY_PACKAGES_PATH):
+    if UTILITY_PACKAGES_PATH and os.path.exists(UTILITY_PACKAGES_PATH):
         LOGGER.log(f"[OK] Utility notebook found: {UTILITY_PACKAGES_PATH}", "INFO")
         
         # Check what packages are available
@@ -1250,10 +1262,11 @@ def verify_setup():
         except:
             pass
     else:
-        issues.append(f"Utility notebook NOT found at {UTILITY_PACKAGES_PATH}")
-        LOGGER.log(f"[FAIL] Utility notebook NOT found!", "ERROR")
-        LOGGER.log(f"       Expected: {UTILITY_PACKAGES_PATH}", "ERROR")
-        LOGGER.log(f"       Fix: Add Input → select your utility notebook", "ERROR")
+        issues.append("Utility notebook NOT found")
+        LOGGER.log("[FAIL] Utility notebook NOT found!", "ERROR")
+        LOGGER.log(f"       Checked: {UTILITY_PATH_USR_LIB}", "ERROR")
+        LOGGER.log(f"       Checked: {UTILITY_PATH_INPUT}", "ERROR")
+        LOGGER.log("       Fix: Attach utility notebook via 'Set as Utility Script'", "ERROR")
     
     # Check 2: vLLM available
     if USE_VLLM:
