@@ -17,6 +17,7 @@ Based on a notebook that scored 35/50 on AIMO 3.
 # CELL 1: TIMING AND CONSTANTS
 # ============================================================
 import time
+import sys
 import numpy as np
 import os
 
@@ -489,13 +490,19 @@ class PythonTool:
 
 try:
     # Import PROMETHEUS engines
-    import sys
-    import os
+    # Note: In Kaggle notebooks, __file__ is not defined, so we use different paths
     
-    # Add PROMETHEUS to path if running from Kaggle
-    prometheus_path = os.path.dirname(os.path.abspath(__file__))
-    if prometheus_path not in sys.path:
-        sys.path.insert(0, prometheus_path)
+    # Try multiple possible locations for PROMETHEUS
+    _prometheus_paths = [
+        "/kaggle/working/prometheus",           # If uploaded to working dir
+        "/kaggle/input/prometheus/prometheus",  # If attached as dataset
+        "/kaggle/usr/lib/prometheus",           # If in utility notebook
+        ".",                                    # Current directory
+    ]
+    
+    for _path in _prometheus_paths:
+        if os.path.exists(_path) and _path not in sys.path:
+            sys.path.insert(0, _path)
     
     from prometheus.engines.algebra import AlgebraEngine
     from prometheus.engines.number_theory import NumberTheoryEngine
@@ -506,6 +513,7 @@ try:
     print("[SETUP] PROMETHEUS engines loaded")
 except ImportError as e:
     print(f"[WARN] PROMETHEUS engines not available: {e}")
+    print("[INFO] This is fine - Python tool will handle all math operations")
     PROMETHEUS_AVAILABLE = False
     AlgebraEngine = None
     NumberTheoryEngine = None
