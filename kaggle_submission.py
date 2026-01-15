@@ -482,7 +482,153 @@ class PythonTool:
 
 
 # ============================================================
-# CELL 9: IMPORTS (after packages are uninstalled)
+# CELL 9: PROMETHEUS MATH ENGINES (THE KEY DIFFERENCE!)
+# ============================================================
+# This is what makes this different from the base notebook:
+# We expose PROMETHEUS's specialized math engines as tools.
+
+try:
+    # Import PROMETHEUS engines
+    import sys
+    import os
+    
+    # Add PROMETHEUS to path if running from Kaggle
+    prometheus_path = os.path.dirname(os.path.abspath(__file__))
+    if prometheus_path not in sys.path:
+        sys.path.insert(0, prometheus_path)
+    
+    from prometheus.engines.algebra import AlgebraEngine
+    from prometheus.engines.number_theory import NumberTheoryEngine
+    from prometheus.engines.geometry import GeometryEngine
+    from prometheus.engines.combinatorics import CombinatoricsEngine
+    
+    PROMETHEUS_AVAILABLE = True
+    print("[SETUP] PROMETHEUS engines loaded")
+except ImportError as e:
+    print(f"[WARN] PROMETHEUS engines not available: {e}")
+    PROMETHEUS_AVAILABLE = False
+    AlgebraEngine = None
+    NumberTheoryEngine = None
+    GeometryEngine = None
+    CombinatoricsEngine = None
+
+
+class PrometheusTool:
+    """
+    Wrapper for PROMETHEUS math engines as Harmony tools.
+    
+    This exposes specialized math operations (algebra, number theory, 
+    geometry, combinatorics) as structured tools that GPT-OSS can call.
+    """
+    
+    def __init__(self):
+        if not PROMETHEUS_AVAILABLE:
+            raise RuntimeError("PROMETHEUS engines not available")
+        
+        self.algebra = AlgebraEngine()
+        self.number_theory = NumberTheoryEngine()
+        self.geometry = GeometryEngine()
+        self.combinatorics = CombinatoricsEngine()
+    
+    @property
+    def name(self) -> str:
+        return "prometheus"
+    
+    def execute(self, engine: str, operation: str, **kwargs) -> str:
+        """
+        Execute a PROMETHEUS math operation.
+        
+        Args:
+            engine: "algebra", "number_theory", "geometry", or "combinatorics"
+            operation: The operation name (e.g., "simplify", "solve", "gcd")
+            **kwargs: Operation-specific arguments
+        
+        Returns:
+            String result or error message
+        """
+        try:
+            if engine == "algebra":
+                return self._execute_algebra(operation, **kwargs)
+            elif engine == "number_theory":
+                return self._execute_number_theory(operation, **kwargs)
+            elif engine == "geometry":
+                return self._execute_geometry(operation, **kwargs)
+            elif engine == "combinatorics":
+                return self._execute_combinatorics(operation, **kwargs)
+            else:
+                return f"[ERROR] Unknown engine: {engine}"
+        except Exception as e:
+            return f"[ERROR] {str(e)}"
+    
+    def _execute_algebra(self, operation: str, **kwargs) -> str:
+        """Execute algebra operation."""
+        if operation == "simplify":
+            result = self.algebra.simplify(kwargs.get("expr", ""))
+        elif operation == "expand":
+            result = self.algebra.expand(kwargs.get("expr", ""))
+        elif operation == "factor":
+            result = self.algebra.factor(kwargs.get("expr", ""))
+        elif operation == "solve":
+            result = self.algebra.solve(
+                kwargs.get("equation", ""),
+                variable=kwargs.get("variable", "x"),
+                domain=kwargs.get("domain", "complex")
+            )
+        else:
+            return f"[ERROR] Unknown algebra operation: {operation}"
+        
+        if result.success:
+            return f"Result: {result.result}\nMethod: {result.method}"
+        else:
+            return f"[ERROR] {result.error}"
+    
+    def _execute_number_theory(self, operation: str, **kwargs) -> str:
+        """Execute number theory operation."""
+        if operation == "gcd":
+            result = self.number_theory.gcd(
+                int(kwargs.get("a", 0)),
+                int(kwargs.get("b", 0))
+            )
+        elif operation == "lcm":
+            result = self.number_theory.lcm(
+                int(kwargs.get("a", 0)),
+                int(kwargs.get("b", 0))
+            )
+        elif operation == "is_prime":
+            result = self.number_theory.is_prime(int(kwargs.get("n", 0)))
+        elif operation == "factorize":
+            result = self.number_theory.factorize(int(kwargs.get("n", 0)))
+        elif operation == "mod":
+            result = self.number_theory.mod(
+                int(kwargs.get("a", 0)),
+                int(kwargs.get("m", 1))
+            )
+        else:
+            return f"[ERROR] Unknown number theory operation: {operation}"
+        
+        if result.success:
+            steps = "\n".join(result.steps) if result.steps else ""
+            output = f"Result: {result.result}\nMethod: {result.method}"
+            if steps:
+                output += f"\nSteps:\n{steps}"
+            return output
+        else:
+            return f"[ERROR] {result.error}"
+    
+    def _execute_geometry(self, operation: str, **kwargs) -> str:
+        """Execute geometry operation."""
+        # Geometry operations are more complex - for now, return a message
+        # In a full implementation, you'd parse geometric objects and call methods
+        return f"[INFO] Geometry operation '{operation}' - use Python tool for complex geometry"
+    
+    def _execute_combinatorics(self, operation: str, **kwargs) -> str:
+        """Execute combinatorics operation."""
+        # Similar to geometry - placeholder for now
+        return f"[INFO] Combinatorics operation '{operation}' - use Python tool for complex counting"
+
+
+# ============================================================
+# CELL 10: IMPORTS (after packages are uninstalled)
 # ============================================================
 import warnings
 warnings.simplefilter('ignore')
@@ -568,13 +714,14 @@ Your approach must be systematic and thorough:
    - Justify all nontrivial steps in your reasoning
    - Show your work clearly and logically
    - Check edge cases and special conditions
-4. **Tool-Assisted Computation**: Use the python tool liberally to:
-   - Perform complex calculations
-   - Verify intermediate results
-   - Check algebraic manipulations
-   - Validate numerical computations
-   - Test edge cases programmatically
-5. **Verification**: Before finalizing your answer, use the python tool to verify your solution satisfies all problem constraints.
+4. **Tool-Assisted Computation**: Use the available tools:
+   - **prometheus tool**: For specialized math operations (algebra, number theory, geometry, combinatorics)
+     - Use "algebra" engine for: simplify, expand, factor, solve equations
+     - Use "number_theory" engine for: gcd, lcm, prime checks, factorization, modular arithmetic
+     - Use "geometry" and "combinatorics" engines for domain-specific operations
+   - **python tool**: For general computation, numerical work, and complex calculations
+   - Prefer prometheus for verified symbolic math, python for numerical/computational work
+5. **Verification**: Before finalizing your answer, verify your solution satisfies all problem constraints using tools.
 6. **Final Answer**: Return only the final verified answer in \\boxed{n}, where n is an integer in [0, 99999]. Never guess - only provide an answer you have rigorously verified.
 
 Remember: Mathematical rigor is paramount. Every step must be justified, and all computations should be verified using the available tools."""
@@ -821,6 +968,15 @@ class HarmonyTIRInferencer:
         self.stop_token_ids = []
         if HARMONY_AVAILABLE and encoding:
             self.stop_token_ids = encoding.stop_tokens_for_assistant_actions()
+        
+        # Initialize PROMETHEUS tool if available
+        self.prometheus_tool = None
+        if PROMETHEUS_AVAILABLE:
+            try:
+                self.prometheus_tool = PrometheusTool()
+                print("[SETUP] PROMETHEUS tool initialized")
+            except Exception as e:
+                print(f"[WARN] Failed to initialize PROMETHEUS tool: {e}")
 
     def wait_server(self, timeout: int = 900):
         """Wait until vLLM server is ready."""
@@ -872,23 +1028,34 @@ class HarmonyTIRInferencer:
         return prompts
 
     def apply_chat_template(self, prompt: str, python_tool: PythonTool) -> list:
-        """Create Harmony conversation format."""
+        """Create Harmony conversation format with both Python and PROMETHEUS tools."""
         if not HARMONY_AVAILABLE:
             return []
         
-        tool_config = ToolNamespaceConfig(
+        # Python tool config
+        python_tool_config = ToolNamespaceConfig(
             name="python",
             description="Execute Python code. Use print() to see output.",
             tools=[]
         )
         
+        # PROMETHEUS tool config (if available)
+        tool_configs = [python_tool_config]
+        if self.prometheus_tool:
+            prometheus_tool_config = ToolNamespaceConfig(
+                name="prometheus",
+                description="Specialized math engines: algebra (simplify, expand, factor, solve), number_theory (gcd, lcm, is_prime, factorize, mod), geometry, combinatorics.",
+                tools=[]
+            )
+            tool_configs.append(prometheus_tool_config)
+        
+        # Create system message with all tools
+        system_content = SystemContent.new().with_reasoning_effort(reasoning_effort=ReasoningEffort.HIGH)
+        for tool_config in tool_configs:
+            system_content = system_content.with_tools(tool_config)
+        
         return [
-            Message.from_role_and_content(
-                Role.SYSTEM,
-                SystemContent.new()
-                .with_reasoning_effort(reasoning_effort=ReasoningEffort.HIGH)
-                .with_tools(tool_config)
-            ),
+            Message.from_role_and_content(Role.SYSTEM, system_content),
             Message.from_role_and_content(Role.USER, prompt),
         ]
 
@@ -1058,29 +1225,78 @@ class HarmonyTIRInferencer:
                 if last_message.channel == "final" or (token_buffer and token_buffer[-1] == 200002):
                     break
 
-                if last_message.recipient == "python":
+                # Handle tool calls
+                if last_message.recipient in ["python", "prometheus"]:
                     if stop_event and stop_event.is_set():
                         break
                     if getattr(self, "deadline", None) and time.time() >= self.deadline:
                         break
 
-                    py_timeout = _compute_py_timeout()
-                    if py_timeout < 0.5:
+                    tool_timeout = _compute_py_timeout()
+                    if tool_timeout < 0.5:
                         break
 
-                    print("[TOOL] Executing Python code...")
-                    try:
-                        code = last_message.content[0].text
-                        output = python_tool.execute(code, timeout=py_timeout)
-                        
-                        # Create response message
-                        response_content = TextContent(text=output)
-                        author = Author(role=Role.TOOL, name="python")
-                        response_msg = Message(author=author, content=[response_content]).with_recipient("assistant")
-                        messages.append(response_msg)
-                    except Exception as e:
-                        print(f"[WARN] Python tool failed: {e}")
-                        break
+                    if last_message.recipient == "python":
+                        print("[TOOL] Executing Python code...")
+                        try:
+                            code = last_message.content[0].text
+                            output = python_tool.execute(code, timeout=tool_timeout)
+                            
+                            # Create response message
+                            response_content = TextContent(text=output)
+                            author = Author(role=Role.TOOL, name="python")
+                            response_msg = Message(author=author, content=[response_content]).with_recipient("assistant")
+                            messages.append(response_msg)
+                        except Exception as e:
+                            print(f"[WARN] Python tool failed: {e}")
+                            break
+                    
+                    elif last_message.recipient == "prometheus" and self.prometheus_tool:
+                        print("[TOOL] Executing PROMETHEUS math operation...")
+                        try:
+                            # Parse tool call from message
+                            # The message content should contain JSON with engine, operation, and args
+                            import json
+                            tool_call_text = last_message.content[0].text
+                            
+                            # Try to parse as JSON
+                            try:
+                                tool_call = json.loads(tool_call_text)
+                                engine = tool_call.get("engine", "")
+                                operation = tool_call.get("operation", "")
+                                args = tool_call.get("args", {})
+                            except:
+                                # Fallback: try to extract from text
+                                # Format: "engine: algebra, operation: simplify, expr: x^2+2x+1"
+                                engine = ""
+                                operation = ""
+                                args = {}
+                                for line in tool_call_text.split("\n"):
+                                    if ":" in line:
+                                        key, value = line.split(":", 1)
+                                        key = key.strip().lower()
+                                        value = value.strip()
+                                        if key == "engine":
+                                            engine = value
+                                        elif key == "operation":
+                                            operation = value
+                                        else:
+                                            args[key] = value
+                            
+                            output = self.prometheus_tool.execute(engine, operation, **args)
+                            
+                            # Create response message
+                            response_content = TextContent(text=output)
+                            author = Author(role=Role.TOOL, name="prometheus")
+                            response_msg = Message(author=author, content=[response_content]).with_recipient("assistant")
+                            messages.append(response_msg)
+                        except Exception as e:
+                            print(f"[WARN] PROMETHEUS tool failed: {e}")
+                            # Still send error response so LLM knows it failed
+                            error_content = TextContent(text=f"[ERROR] {str(e)}")
+                            author = Author(role=Role.TOOL, name="prometheus")
+                            response_msg = Message(author=author, content=[error_content]).with_recipient("assistant")
+                            messages.append(response_msg)
 
             if final_answer_found:
                 return final_answer_found
