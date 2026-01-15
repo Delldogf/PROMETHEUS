@@ -1,12 +1,19 @@
 """
-PROMETHEUS + GPT-OSS-120B Kaggle Submission
-============================================
+PROMETHEUS + GPT-OSS-120B Kaggle Submission (AIMO 3)
+=====================================================
 
 This notebook combines:
 - GPT-OSS-120B: For reasoning and tool orchestration
 - PROMETHEUS: For verified mathematical computation
 
 The LLM uses PROMETHEUS tools to solve olympiad problems with verified answers.
+
+AIMO 3 Answer Format: Integer from 0 to 99999 (5 digits)
+
+IMPORTANT vLLM Notes:
+- Use vLLM >= 0.10.2 for tool calling support
+- GPT-OSS may have issues with vLLM V1 engine, set VLLM_USE_V1=0 if unstable
+- For H100: works great with --async-scheduling flag
 """
 
 import os
@@ -20,7 +27,21 @@ from functools import lru_cache
 import torch
 import polars as pl
 import pandas as pd
-from transformers import AutoModelForCausalLM, AutoTokenizer
+
+# vLLM Compatibility Note:
+# GPT-OSS works best with vLLM 0.10.2 for tool calling
+# If you experience instability, set: os.environ["VLLM_USE_V1"] = "0"
+# This disables the V1 engine which can have issues with GPT-OSS
+
+# Try vLLM first (preferred for tool calling), fallback to Transformers
+try:
+    from vllm import LLM
+    from vllm.sampling_params import SamplingParams
+    USE_VLLM = True
+except ImportError:
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+    USE_VLLM = False
+    print("vLLM not available, using Transformers (tool calling may be limited)")
 
 # ============================================================
 # PROMETHEUS MATH TOOLS (Verified Computations)
@@ -548,23 +569,52 @@ def execute_tool(name: str, arguments: Dict[str, Any]) -> str:
 
 
 # ============================================================
-# GPT-OSS-120B SOLVER
+# GPT-OSS-120B SOLVER (Supports both vLLM and Transformers)
 # ============================================================
 
 class PrometheusSolver:
     """
     PROMETHEUS solver using GPT-OSS-120B with tool calling.
+    
+    Supports two backends:
+    - vLLM (preferred): Native tool calling via llm.chat(..., tools=TOOLS)
+    - Transformers (fallback): Manual tool call extraction
+    
+    For vLLM stability with GPT-OSS, you may need to:
+    - Use vLLM 0.10.2
+    - Set VLLM_USE_V1=0 if experiencing issues
     """
     
     def __init__(self, model_path: str = "/kaggle/input/gpt-oss-120b/transformers/default/1"):
         print("Loading GPT-OSS-120B...")
-        self.tokenizer = AutoTokenizer.from_pretrained(model_path)
-        self.model = AutoModelForCausalLM.from_pretrained(
-            model_path,
-            torch_dtype=torch.float16,
-            device_map="auto",
-            trust_remote_code=True
-        )
+        print(f"Using backend: {'vLLM' if USE_VLLM else 'Transformers'}")
+        
+        self.model_path = model_path
+        
+        if USE_VLLM:
+            # vLLM backend - native tool calling support
+            self.llm = LLM(
+                model=model_path,
+                trust_remote_code=True,
+                dtype="float16",
+                # Recommended settings for GPT-OSS stability
+                max_model_len=32768,
+            )
+            self.sampling_params = SamplingParams(
+                max_tokens=4096,
+                temperature=0.3,
+            )
+        else:
+            # Transformers backend - manual tool handling
+            from transformers import AutoModelForCausalLM, AutoTokenizer
+            self.tokenizer = AutoTokenizer.from_pretrained(model_path)
+            self.model = AutoModelForCausalLM.from_pretrained(
+                model_path,
+                torch_dtype=torch.float16,
+                device_map="auto",
+                trust_remote_code=True
+            )
+        
         print("Model loaded successfully!")
         
         self.system_prompt = """You are PROMETHEUS, an expert mathematical olympiad solver.
@@ -582,19 +632,69 @@ Your task is to solve competition math problems. Think step by step:
 3. Plan your approach
 4. Use tools for any calculations
 5. Verify your answer makes sense
-6. Return the final answer as a single integer mod 1000
+6. Return the final answer as a single integer from 0 to 99999
 
-IMPORTANT: The final answer must be an integer between 0 and 999."""
+IMPORTANT: The final answer must be a 5-digit integer between 0 and 99999."""
 
     def solve(self, problem: str, max_iterations: int = 10) -> int:
         """
         Solve a math problem using GPT-OSS-120B with tool calling.
         
-        Returns: Integer answer (0-999)
+        Returns: Integer answer (0-99999 for AIMO 3)
         """
+        if USE_VLLM:
+            return self._solve_vllm(problem, max_iterations)
+        else:
+            return self._solve_transformers(problem, max_iterations)
+    
+    def _solve_vllm(self, problem: str, max_iterations: int = 10) -> int:
+        """Solve using vLLM with native tool calling."""
         messages = [
             {"role": "system", "content": self.system_prompt},
-            {"role": "user", "content": f"Solve this problem and give the final answer as an integer mod 1000:\n\n{problem}"}
+            {"role": "user", "content": f"Solve this problem and give the final answer as an integer from 0 to 99999:\n\n{problem}"}
+        ]
+        
+        for iteration in range(max_iterations):
+            # Use vLLM's native chat interface with tools
+            outputs = self.llm.chat(
+                messages,
+                sampling_params=self.sampling_params,
+                tools=TOOLS
+            )
+            
+            response_text = outputs[0].outputs[0].text.strip()
+            
+            # Check if the model made tool calls (vLLM returns JSON for tool calls)
+            tool_calls = self._extract_tool_calls(response_text)
+            
+            if tool_calls:
+                # Execute tools and add results
+                messages.append({"role": "assistant", "content": response_text})
+                
+                tool_results = []
+                for tool_call in tool_calls:
+                    result = execute_tool(tool_call["name"], tool_call["arguments"])
+                    tool_results.append(f"{tool_call['name']}: {result}")
+                
+                # Add tool results as a single message
+                messages.append({
+                    "role": "tool",
+                    "content": "\n".join(tool_results),
+                    "tool_call_id": f"call_{iteration}"
+                })
+            else:
+                # No tool calls - extract final answer
+                answer = self._extract_answer(response_text)
+                return max(0, min(99999, answer))
+        
+        # Fallback if max iterations reached
+        return 0
+    
+    def _solve_transformers(self, problem: str, max_iterations: int = 10) -> int:
+        """Solve using Transformers (manual tool call handling)."""
+        messages = [
+            {"role": "system", "content": self.system_prompt},
+            {"role": "user", "content": f"Solve this problem and give the final answer as an integer from 0 to 99999:\n\n{problem}"}
         ]
         
         for iteration in range(max_iterations):
@@ -610,8 +710,7 @@ IMPORTANT: The final answer must be an integer between 0 and 999."""
                     max_new_tokens=2048,
                     temperature=0.3,
                     do_sample=True,
-                    pad_token_id=self.tokenizer.eos_token_id,
-                    tools=TOOLS  # Pass tools to the model
+                    pad_token_id=self.tokenizer.eos_token_id
                 )
             
             response_text = self.tokenizer.decode(
@@ -636,13 +735,13 @@ IMPORTANT: The final answer must be an integer between 0 and 999."""
             else:
                 # No tool calls - extract final answer
                 answer = self._extract_answer(response_text)
-                return answer % 1000
+                return max(0, min(99999, answer))
         
         # Fallback if max iterations reached
         return 0
     
     def _format_messages(self, messages: List[Dict]) -> str:
-        """Format messages for the model."""
+        """Format messages for the Transformers backend."""
         formatted = ""
         for msg in messages:
             role = msg["role"]
@@ -655,7 +754,8 @@ IMPORTANT: The final answer must be an integer between 0 and 999."""
             elif role == "assistant":
                 formatted += f"<|assistant|>\n{content}\n"
             elif role == "tool":
-                formatted += f"<|tool_result|>\n{msg['name']}: {content}\n"
+                name = msg.get('name', 'tool')
+                formatted += f"<|tool_result|>\n{name}: {content}\n"
         
         formatted += "<|assistant|>\n"
         return formatted
@@ -665,10 +765,10 @@ IMPORTANT: The final answer must be an integer between 0 and 999."""
         tool_calls = []
         
         # Look for JSON-formatted tool calls
-        # Pattern: {"name": "tool_name", "arguments": {...}}
-        pattern = r'\{[^{}]*"name"\s*:\s*"(\w+)"[^{}]*"arguments"\s*:\s*(\{[^{}]*\})[^{}]*\}'
+        # Pattern 1: {"name": "tool_name", "arguments": {...}}
+        pattern1 = r'\{[^{}]*"name"\s*:\s*"(\w+)"[^{}]*"arguments"\s*:\s*(\{[^{}]*\})[^{}]*\}'
         
-        for match in re.finditer(pattern, response):
+        for match in re.finditer(pattern1, response):
             try:
                 name = match.group(1)
                 args_str = match.group(2)
@@ -677,16 +777,28 @@ IMPORTANT: The final answer must be an integer between 0 and 999."""
             except:
                 continue
         
+        # Pattern 2: Try parsing as JSON array (vLLM style)
+        if not tool_calls:
+            try:
+                parsed = json.loads(response)
+                if isinstance(parsed, list):
+                    for item in parsed:
+                        if "name" in item and "arguments" in item:
+                            tool_calls.append(item)
+            except:
+                pass
+        
         return tool_calls
     
     def _extract_answer(self, response: str) -> int:
-        """Extract the final numerical answer from response."""
+        """Extract the final numerical answer from response (AIMO 3: 0-99999)."""
         # Look for explicit answer patterns
         patterns = [
             r"(?:final\s+)?answer\s*(?:is|:)\s*(\d+)",
             r"(?:result|solution)\s*(?:is|:)\s*(\d+)",
+            r"\\boxed\{(\d+)\}",  # LaTeX boxed format
             r"=\s*(\d+)\s*$",
-            r"(\d+)\s*(?:mod\s*1000)?\s*$",
+            r"(\d{1,5})\s*$",  # Up to 5 digits at end
         ]
         
         response_lower = response.lower()
@@ -724,9 +836,10 @@ def get_solver():
 
 def predict(id_: pl.DataFrame, question: pl.DataFrame) -> pl.DataFrame:
     """
-    Make a prediction for the AIMO 2 competition.
+    Make a prediction for the AIMO 3 competition.
     
     This function is called by the Kaggle evaluation server.
+    AIMO 3 answers must be integers from 0 to 99999.
     """
     # Unpack values
     problem_id = id_.item(0)
@@ -747,8 +860,8 @@ def predict(id_: pl.DataFrame, question: pl.DataFrame) -> pl.DataFrame:
         print(f"\nError: {e}")
         answer = 0
     
-    # Ensure answer is in valid range
-    answer = answer % 1000
+    # Ensure answer is in valid AIMO 3 range (0-99999)
+    answer = max(0, min(99999, answer))
     
     return pl.DataFrame({'id': problem_id, 'answer': answer})
 
@@ -758,10 +871,20 @@ def predict(id_: pl.DataFrame, question: pl.DataFrame) -> pl.DataFrame:
 # ============================================================
 
 if __name__ == "__main__":
-    import kaggle_evaluation.aimo_2_inference_server
+    # AIMO 3 Competition - Try to import the correct inference server
+    # The module name may be aimo_3_inference_server or still aimo_2_inference_server
+    try:
+        import kaggle_evaluation.aimo_3_inference_server as aimo_server
+        InferenceServer = aimo_server.AIMO3InferenceServer
+        test_csv_path = '/kaggle/input/ai-mathematical-olympiad-progress-prize-3/test.csv'
+    except ImportError:
+        # Fallback to AIMO 2 module if AIMO 3 not available
+        import kaggle_evaluation.aimo_2_inference_server as aimo_server
+        InferenceServer = aimo_server.AIMO2InferenceServer
+        test_csv_path = '/kaggle/input/ai-mathematical-olympiad-progress-prize-2/test.csv'
     
     # Create inference server
-    inference_server = kaggle_evaluation.aimo_2_inference_server.AIMO2InferenceServer(predict)
+    inference_server = InferenceServer(predict)
     
     # Run in appropriate mode
     if os.getenv('KAGGLE_IS_COMPETITION_RERUN'):
@@ -769,6 +892,4 @@ if __name__ == "__main__":
         inference_server.serve()
     else:
         # Local testing mode
-        inference_server.run_local_gateway(
-            ('/kaggle/input/ai-mathematical-olympiad-progress-prize-2/test.csv',)
-        )
+        inference_server.run_local_gateway((test_csv_path,))
