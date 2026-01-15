@@ -31,10 +31,12 @@ DIAGNOSTICS:
 KNOWN ISSUES & FIXES:
 - If you see "ModuleNotFoundError: No module named 'rpds.rpds'" - this is a Kaggle
   environment bug, not our code. See FIX_RPDS_ERROR below.
+- If you see "numpy.dtype size changed, may indicate binary incompatibility" - 
+  this is a numpy/sklearn version mismatch. See FIX_NUMPY_ERROR below.
 """
 
 # ============================================================
-# FIX: KAGGLE ENVIRONMENT BUG (rpds.rpds error)
+# FIX 1: KAGGLE ENVIRONMENT BUG (rpds.rpds error)
 # ============================================================
 # If you encounter "ModuleNotFoundError: No module named 'rpds.rpds'", 
 # this is a bug in Kaggle's aimoutility environment, not our code.
@@ -48,6 +50,23 @@ KNOWN ISSUES & FIXES:
 #
 # The error happens BEFORE your Python code runs (during notebook conversion),
 # so if you see this error, the notebook isn't even starting your code yet.
+# ============================================================
+
+# ============================================================
+# FIX 2: NUMPY/SKLEARN BINARY INCOMPATIBILITY
+# ============================================================
+# If you encounter "numpy.dtype size changed, may indicate binary incompatibility",
+# this means sklearn was compiled with a different numpy version.
+#
+# WORKAROUND - Add this as the FIRST CELL of your notebook:
+#
+#   !pip install --quiet --force-reinstall numpy==1.26.4
+#   !pip install --quiet --force-reinstall scikit-learn
+#
+# Then RESTART the notebook kernel and run again.
+#
+# This error happens because Kaggle's pre-installed packages are sometimes
+# compiled against different versions of numpy.
 # ============================================================
 
 import os
@@ -208,6 +227,31 @@ LOGGER = DiagnosticLogger(verbose=True)
 
 
 # ============================================================
+# KAGGLE ENVIRONMENT FIXES
+# ============================================================
+
+# Fix for numpy/sklearn binary incompatibility in Kaggle
+# This error: "numpy.dtype size changed, may indicate binary incompatibility"
+# happens when sklearn was compiled with a different numpy version
+try:
+    import subprocess
+    import sys
+    
+    # Check if we're in a Kaggle environment
+    if os.path.exists('/kaggle'):
+        LOGGER.log("Kaggle environment detected - checking package compatibility", "INFO")
+        
+        # Try to fix numpy/sklearn compatibility if needed
+        # This might help with the binary incompatibility error
+        # Uncomment the lines below if you get numpy.dtype errors:
+        # subprocess.run([sys.executable, "-m", "pip", "install", "--quiet", 
+        #                 "--force-reinstall", "numpy==1.26.4"], check=False)
+        # subprocess.run([sys.executable, "-m", "pip", "install", "--quiet",
+        #                 "--force-reinstall", "scikit-learn"], check=False)
+except Exception as e:
+    LOGGER.log(f"Environment fix check failed (non-critical): {e}", "WARN")
+
+# ============================================================
 # VLLM STABILITY SETTINGS FOR GPT-OSS
 # ============================================================
 
@@ -215,21 +259,28 @@ LOGGER = DiagnosticLogger(verbose=True)
 # Uncomment the line below if you experience hangs or garbled output
 # os.environ["VLLM_USE_V1"] = "0"
 
+# Disable tensorflow logging before imports (reduces noise)
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+
 # Try vLLM first (preferred for tool calling), fallback to Transformers
+USE_VLLM = False
 try:
     from vllm import LLM
     from vllm.sampling_params import SamplingParams
     USE_VLLM = True
     LOGGER.log("vLLM imported successfully", "INFO")
-except ImportError as e:
+except (ImportError, ValueError, OSError) as e:
     USE_VLLM = False
-    LOGGER.log(f"vLLM not available: {e}", "WARN")
-    LOGGER.log("Falling back to Transformers (tool calling may be limited)", "WARN")
+    LOGGER.log(f"vLLM not available: {type(e).__name__}: {e}", "WARN")
+    LOGGER.log("Falling back to Transformers", "WARN")
+
+# If vLLM failed, try Transformers
+if not USE_VLLM:
     try:
         from transformers import AutoModelForCausalLM, AutoTokenizer
         LOGGER.log("Transformers imported successfully", "INFO")
-    except ImportError as e2:
-        LOGGER.log(f"Transformers also not available: {e2}", "ERROR")
+    except (ImportError, ValueError, OSError) as e2:
+        LOGGER.log(f"Transformers also not available: {type(e2).__name__}: {e2}", "ERROR")
 
 # ============================================================
 # PROMETHEUS MATH TOOLS (Verified Computations)
