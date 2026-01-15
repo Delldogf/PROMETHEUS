@@ -27,7 +27,28 @@ DIAGNOSTICS:
 - GPU/CPU memory usage is tracked
 - Problem-level timing and answers are logged
 - Tool call execution is logged
+
+KNOWN ISSUES & FIXES:
+- If you see "ModuleNotFoundError: No module named 'rpds.rpds'" - this is a Kaggle
+  environment bug, not our code. See FIX_RPDS_ERROR below.
 """
+
+# ============================================================
+# FIX: KAGGLE ENVIRONMENT BUG (rpds.rpds error)
+# ============================================================
+# If you encounter "ModuleNotFoundError: No module named 'rpds.rpds'", 
+# this is a bug in Kaggle's aimoutility environment, not our code.
+#
+# WORKAROUND OPTIONS:
+# 1. Create a fresh notebook and paste this code (sometimes fixes it)
+# 2. Add this as the FIRST CELL of your notebook (with internet enabled):
+#    !pip install --force-reinstall rpds-py referencing jsonschema
+# 3. If that doesn't work, the issue is in Kaggle's papermill/nbconvert pipeline
+#    and you may need to report it to Kaggle or wait for them to fix it.
+#
+# The error happens BEFORE your Python code runs (during notebook conversion),
+# so if you see this error, the notebook isn't even starting your code yet.
+# ============================================================
 
 import os
 import re
