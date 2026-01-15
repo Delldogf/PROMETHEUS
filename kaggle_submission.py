@@ -16,38 +16,101 @@ COMPETITION REQUIREMENTS (AIMO 3):
 - Must call serve() within 15 minutes of script start
 - Model loading should happen INSIDE predict() (lazy loading)
 
+HOW THE UTILITY NOTEBOOK SYSTEM WORKS:
+======================================
+Since AIMO 3 has no internet during submission, we use a two-notebook system:
+
+1. UTILITY NOTEBOOK (runs first, WITH internet):
+   - Uninstalls broken Kaggle packages (tensorflow, keras, sklearn, numpy, torch)
+   - Installs correct versions to /kaggle/working
+   - Save it → packages become part of its "Output"
+   - Example: https://www.kaggle.com/code/friederrr/aimo3-utility-notebook-dependency-install-1-2
+
+2. SUBMISSION NOTEBOOK (this file, runs WITHOUT internet):
+   - Attach the utility notebook as an input
+   - The packages are now available at /kaggle/input/<your-utility-notebook-name>/
+   - We add that path to sys.path BEFORE importing anything
+
+SETUP STEPS:
+1. Copy/fork the utility notebook: friederrr/aimo3-utility-notebook-dependency-install-1-2
+2. Run & save it (this installs packages to its output)
+3. In THIS notebook, click "Add Input" → add your utility notebook
+4. Update UTILITY_NOTEBOOK_NAME below to match your copy's name
+5. Attach the GPT-OSS-120B model as input
+
 VLLM COMPATIBILITY NOTES:
 - Use vLLM >= 0.10.2 for tool calling support
 - GPT-OSS may have issues with vLLM V1 engine
 - Set VLLM_USE_V1=0 if experiencing instability
-- For H100: use --async-scheduling flag for better performance
 
-DIAGNOSTICS:
-- All major operations are logged with timestamps
-- GPU/CPU memory usage is tracked
-- Problem-level timing and answers are logged
-- Tool call execution is logged
-
-KNOWN ISSUES & FIXES:
-
-1. "ModuleNotFoundError: No module named 'rpds.rpds'" 
-   → Kaggle environment bug. Try creating a fresh notebook.
-
-2. "numpy.dtype size changed, may indicate binary incompatibility"
-   → This is FIXED by setting TRANSFORMERS_NO_TF=1 before imports.
-   → The error happens because: vllm → transformers → tensorflow → sklearn → numpy
-   → By skipping tensorflow, we avoid the sklearn import entirely.
-
-3. For best results, FORK A WORKING NOTEBOOK like:
-   - "AIMO 3 | GPT-OSS-120B (with tools)" by Andreas Bisiadis
-   - This has the correct package versions and wheel files pre-attached.
-
-REQUIRED KAGGLE DATASETS:
+REQUIRED KAGGLE INPUTS:
+- Utility notebook: Contains pre-installed packages (vLLM, torch, numpy, etc.)
 - GPT-OSS-120B model: /kaggle/input/gpt-oss-120b/transformers/default/1
-- (Optional) Wheels dataset for vLLM: /kaggle/input/aimo-3-utils/wheels.tar.gz
 """
 
+# ============================================================
+# STEP 1: ADD UTILITY NOTEBOOK PATH (MUST BE BEFORE ALL IMPORTS!)
+# ============================================================
+# This is the critical step that makes the utility notebook system work.
+# The utility notebook pre-installed packages to /kaggle/working,
+# which becomes /kaggle/input/<notebook-name>/ when attached.
+
 import os
+import sys
+
+# ==========================================================
+# CONFIGURE THIS: Set to YOUR utility notebook's name
+# ==========================================================
+# When you copy/fork the utility notebook, update this to match.
+# The name is the last part of the URL, e.g.:
+#   URL: kaggle.com/code/yourusername/my-aimo3-utility
+#   NAME: "my-aimo3-utility"
+
+UTILITY_NOTEBOOK_NAME = "aimo3-utility-notebook-dependency-install-1-2"  # Default (Simon Frieder's)
+
+# Alternative popular utility notebooks you might use:
+# UTILITY_NOTEBOOK_NAME = "pip-install-aimo3-1"  # AI-Cat's version
+# UTILITY_NOTEBOOK_NAME = "pip-install-aimo3-1-gpt-oss-vllm-0.12.0"  # GPT-OSS specific
+
+# Build the path where the utility notebook's packages are located
+UTILITY_PACKAGES_PATH = f"/kaggle/input/{UTILITY_NOTEBOOK_NAME}"
+
+# Add to Python's import path FIRST (before any other imports)
+if os.path.exists(UTILITY_PACKAGES_PATH):
+    # Insert at position 0 so these packages take priority
+    sys.path.insert(0, UTILITY_PACKAGES_PATH)
+    print(f"[SETUP] Added utility notebook to path: {UTILITY_PACKAGES_PATH}")
+    
+    # List what's available (for debugging)
+    try:
+        contents = os.listdir(UTILITY_PACKAGES_PATH)[:10]
+        print(f"[SETUP] Utility notebook contents: {contents}...")
+    except:
+        pass
+else:
+    print(f"[SETUP] WARNING: Utility notebook not found at {UTILITY_PACKAGES_PATH}")
+    print("[SETUP] Make sure you attached your utility notebook as an input!")
+    print("[SETUP] Click 'Add Input' in Kaggle and select your utility notebook")
+
+# Also try the working directory (in case running the utility notebook itself)
+if os.path.exists("/kaggle/working") and "/kaggle/working" not in sys.path:
+    sys.path.insert(0, "/kaggle/working")
+
+# ============================================================
+# STEP 2: ENVIRONMENT VARIABLES (before other imports)
+# ============================================================
+# These help avoid any remaining conflicts
+
+os.environ['TOKENIZERS_PARALLELISM'] = 'false'   # Avoid tokenizer warnings
+os.environ['CUDA_VISIBLE_DEVICES'] = '0'         # Use first GPU
+
+# For vLLM stability with GPT-OSS (use v0 engine, not v1)
+os.environ['VLLM_USE_V1'] = '0'
+
+# ============================================================
+# STEP 3: NOW SAFE TO IMPORT EVERYTHING
+# ============================================================
+
 import re
 import json
 import math
@@ -204,104 +267,43 @@ class DiagnosticLogger:
 LOGGER = DiagnosticLogger(verbose=True)
 
 
-# ============================================================
-# CRITICAL: ENVIRONMENT VARIABLES (SET BEFORE ANY IMPORTS!)
-# ============================================================
-# These MUST be set before importing transformers, vllm, etc.
-# They prevent the cascade: vllm -> transformers -> tensorflow -> keras -> sklearn -> numpy error
-
-os.environ['TRANSFORMERS_NO_TF'] = '1'           # Skip TensorFlow imports
-os.environ['TRANSFORMERS_NO_FLAX'] = '1'         # Skip Flax imports  
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'         # Suppress TF logging
-os.environ['TOKENIZERS_PARALLELISM'] = 'false'   # Avoid tokenizer warnings
-os.environ['CUDA_VISIBLE_DEVICES'] = '0'         # Use first GPU
 
 # ============================================================
-# KAGGLE ENVIRONMENT SETUP
+# IMPORT VLLM (from utility notebook)
 # ============================================================
-
-import subprocess
-import sys
-
-def setup_kaggle_environment():
-    """
-    Set up the Kaggle environment with required packages.
-    
-    IMPORTANT: You need to attach a dataset with pre-built wheel files.
-    The working notebooks use '/kaggle/input/aimo-3-utils/wheels.tar.gz'
-    or similar datasets with vLLM wheels.
-    
-    If you don't have this, you can:
-    1. Fork a working notebook like 'AIMO 3 | GPT-OSS-120B (with tools)'
-    2. Or create your own wheels dataset
-    """
-    wheels_archives = [
-        '/kaggle/input/aimo-3-utils/wheels.tar.gz',  # Common utils dataset
-        '/kaggle/input/vllm-whl/wheels.tar.gz',       # Alternative
-    ]
-    
-    temp_dir = '/kaggle/tmp/setup'
-    
-    for archive in wheels_archives:
-        if os.path.exists(archive):
-            LOGGER.log(f"Found wheels archive: {archive}", "INFO")
-            try:
-                os.makedirs(temp_dir, exist_ok=True)
-                subprocess.run(['tar', '-xzf', archive, '-C', temp_dir], check=True)
-                
-                # Install vLLM from local wheels
-                subprocess.run([
-                    sys.executable, '-m', 'pip', 'install', 
-                    '--no-index', '--find-links', f'{temp_dir}/wheels',
-                    '--quiet', 'vllm'
-                ], check=True)
-                
-                LOGGER.log("Installed vLLM from local wheels", "INFO")
-                return True
-            except Exception as e:
-                LOGGER.log(f"Failed to install from {archive}: {e}", "WARN")
-    
-    LOGGER.log("No wheels archive found - using pre-installed packages", "INFO")
-    return False
-
-# Only run setup in Kaggle
-if os.path.exists('/kaggle'):
-    setup_kaggle_environment()
-
-# ============================================================
-# IMPORT VLLM OR FALLBACK
-# ============================================================
+# The utility notebook should have installed vLLM to the path we added above.
+# If this fails, make sure your utility notebook:
+# 1. Was saved/run successfully
+# 2. Is attached as an input to this notebook
+# 3. Has the correct name in UTILITY_NOTEBOOK_NAME above
 
 USE_VLLM = False
-USE_VLLM_SERVER = False  # Use vLLM as OpenAI-compatible server (recommended)
 
 try:
     from vllm import LLM
     from vllm.sampling_params import SamplingParams
     USE_VLLM = True
-    LOGGER.log("vLLM imported successfully (direct mode)", "INFO")
-except (ImportError, ValueError, OSError) as e:
-    USE_VLLM = False
-    LOGGER.log(f"vLLM direct import failed: {type(e).__name__}: {e}", "WARN")
-    LOGGER.log("Will try vLLM server mode or Transformers fallback", "INFO")
+    LOGGER.log("vLLM imported successfully from utility notebook!", "INFO")
+except ImportError as e:
+    LOGGER.log(f"vLLM import failed: {e}", "WARN")
+    LOGGER.log("Check that your utility notebook is attached and named correctly", "WARN")
+    LOGGER.log(f"Expected path: {UTILITY_PACKAGES_PATH}", "WARN")
+except ValueError as e:
+    # This can happen with numpy/sklearn conflicts if utility notebook wasn't set up right
+    LOGGER.log(f"vLLM import error (likely package conflict): {e}", "ERROR")
+    LOGGER.log("Your utility notebook may need to uninstall tensorflow/sklearn", "ERROR")
+except Exception as e:
+    LOGGER.log(f"Unexpected error importing vLLM: {type(e).__name__}: {e}", "ERROR")
 
-# If direct vLLM failed, try using it as a server (like the working notebooks do)
+# Fallback to Transformers if vLLM not available
 if not USE_VLLM:
-    try:
-        # Check if we can use vLLM as an OpenAI-compatible server
-        from openai import OpenAI
-        USE_VLLM_SERVER = True
-        LOGGER.log("OpenAI client available - can use vLLM server mode", "INFO")
-    except ImportError:
-        pass
-
-# Final fallback to Transformers
-if not USE_VLLM and not USE_VLLM_SERVER:
+    LOGGER.log("Falling back to Transformers backend...", "INFO")
     try:
         from transformers import AutoModelForCausalLM, AutoTokenizer
-        LOGGER.log("Using Transformers as fallback", "INFO")
-    except (ImportError, ValueError, OSError) as e2:
-        LOGGER.log(f"Transformers also not available: {type(e2).__name__}: {e2}", "ERROR")
+        LOGGER.log("Transformers imported successfully", "INFO")
+    except ImportError as e:
+        LOGGER.log(f"Transformers also failed: {e}", "ERROR")
+        LOGGER.log("Neither vLLM nor Transformers available - model loading will fail", "ERROR")
 
 # ============================================================
 # PROMETHEUS MATH TOOLS (Verified Computations)
@@ -1223,12 +1225,83 @@ def predict(id_: pl.Series, question: pl.Series) -> pl.DataFrame | pd.DataFrame:
 
 
 # ============================================================
+# SETUP VERIFICATION
+# ============================================================
+
+def verify_setup():
+    """
+    Verify that the notebook is set up correctly.
+    Call this before submitting to catch configuration errors early.
+    """
+    LOGGER.log("=" * 60, "INFO")
+    LOGGER.log("VERIFYING SETUP", "INFO")
+    LOGGER.log("=" * 60, "INFO")
+    
+    issues = []
+    
+    # Check 1: Utility notebook attached
+    if os.path.exists(UTILITY_PACKAGES_PATH):
+        LOGGER.log(f"[OK] Utility notebook found: {UTILITY_PACKAGES_PATH}", "INFO")
+        
+        # Check what packages are available
+        try:
+            pkg_count = len(os.listdir(UTILITY_PACKAGES_PATH))
+            LOGGER.log(f"     Contains {pkg_count} items", "INFO")
+        except:
+            pass
+    else:
+        issues.append(f"Utility notebook NOT found at {UTILITY_PACKAGES_PATH}")
+        LOGGER.log(f"[FAIL] Utility notebook NOT found!", "ERROR")
+        LOGGER.log(f"       Expected: {UTILITY_PACKAGES_PATH}", "ERROR")
+        LOGGER.log(f"       Fix: Add Input → select your utility notebook", "ERROR")
+    
+    # Check 2: vLLM available
+    if USE_VLLM:
+        LOGGER.log("[OK] vLLM is available", "INFO")
+    else:
+        issues.append("vLLM not available")
+        LOGGER.log("[WARN] vLLM not available - using Transformers fallback", "WARN")
+    
+    # Check 3: GPU available
+    if torch.cuda.is_available():
+        gpu_name = torch.cuda.get_device_name(0)
+        gpu_mem = torch.cuda.get_device_properties(0).total_memory / 1e9
+        LOGGER.log(f"[OK] GPU: {gpu_name} ({gpu_mem:.1f} GB)", "INFO")
+    else:
+        issues.append("No GPU available")
+        LOGGER.log("[WARN] No GPU - will be slow!", "WARN")
+    
+    # Check 4: Model path
+    model_path = "/kaggle/input/gpt-oss-120b/transformers/default/1"
+    if os.path.exists(model_path):
+        LOGGER.log(f"[OK] GPT-OSS-120B model found", "INFO")
+    else:
+        # Not an error in local testing
+        LOGGER.log(f"[SKIP] Model path not found (expected in Kaggle): {model_path}", "INFO")
+    
+    # Summary
+    LOGGER.log("=" * 60, "INFO")
+    if issues:
+        LOGGER.log(f"SETUP ISSUES: {len(issues)}", "WARN")
+        for issue in issues:
+            LOGGER.log(f"  - {issue}", "WARN")
+    else:
+        LOGGER.log("SETUP LOOKS GOOD!", "INFO")
+    LOGGER.log("=" * 60, "INFO")
+    
+    return len(issues) == 0
+
+
+# ============================================================
 # MAIN ENTRY POINT
 # ============================================================
 
 if __name__ == "__main__":
     # Log system information at startup
     LOGGER.log_system_info()
+    
+    # Verify setup before proceeding
+    verify_setup()
     
     # ========================================
     # AIMO 3 Competition Setup
