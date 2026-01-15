@@ -49,15 +49,45 @@ REQUIRED KAGGLE INPUTS:
 """
 
 # ============================================================
-# STEP 1: ENVIRONMENT VARIABLES (MUST BE BEFORE ALL IMPORTS!)
+# STEP 1: BLOCK BROKEN PACKAGES (MUST BE FIRST!)
 # ============================================================
-# CRITICAL: These must be set BEFORE importing transformers/vllm!
-# They prevent the cascade: transformers → tensorflow → keras → sklearn → numpy error
+# CRITICAL: Kaggle has sklearn/tensorflow compiled against numpy 1.x,
+# but the utility notebook installed numpy 2.x. This causes crashes.
+# We BLOCK these packages from being imported to prevent the conflict.
 
 import os
 import sys
 
-# Prevent transformers from importing tensorflow/flax (causes numpy conflicts)
+# ==========================================================
+# BLOCK SKLEARN - prevents "numpy.dtype size changed" error
+# ==========================================================
+# This makes is_sklearn_available() return False in transformers
+# by making "import sklearn" fail before the broken code runs.
+
+class _BlockedModule:
+    """Placeholder that raises ImportError when accessed."""
+    def __init__(self, name):
+        self._name = name
+    def __getattr__(self, attr):
+        raise ImportError(f"Module '{self._name}' is blocked to prevent numpy conflicts")
+
+# Block ALL problematic modules that were compiled against numpy 1.x
+BLOCKED_MODULES = [
+    'sklearn', 'sklearn.metrics', 'sklearn.utils', 'sklearn.base',
+    'tensorflow', 'tensorflow.python',
+    'keras', 'keras.api',
+]
+
+for blocked in BLOCKED_MODULES:
+    if blocked not in sys.modules:  # Don't overwrite if already loaded
+        sys.modules[blocked] = _BlockedModule(blocked)
+
+print(f"[SETUP] Blocked {len(BLOCKED_MODULES)} modules to prevent numpy conflicts")
+
+# ==========================================================
+# ENVIRONMENT VARIABLES
+# ==========================================================
+# Prevent transformers from importing tensorflow/flax
 os.environ['TRANSFORMERS_NO_TF'] = '1'
 os.environ['TRANSFORMERS_NO_FLAX'] = '1'
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
