@@ -49,40 +49,47 @@ REQUIRED KAGGLE INPUTS:
 """
 
 # ============================================================
-# STEP 1: BLOCK BROKEN PACKAGES (MUST BE FIRST!)
+# STEP 1: HIDE BROKEN PACKAGES (MUST BE FIRST!)
 # ============================================================
 # CRITICAL: Kaggle has sklearn/tensorflow compiled against numpy 1.x,
 # but the utility notebook installed numpy 2.x. This causes crashes.
-# We BLOCK these packages from being imported to prevent the conflict.
+#
+# We patch importlib.util.find_spec to make these packages INVISIBLE.
+# This makes is_sklearn_available() and is_tf_available() return False
+# in transformers/vllm, so they never try to import the broken packages.
 
 import os
 import sys
+import importlib.util
 
 # ==========================================================
-# BLOCK SKLEARN - prevents "numpy.dtype size changed" error
+# HIDE BROKEN PACKAGES FROM PYTHON'S IMPORT SYSTEM
 # ==========================================================
-# This makes is_sklearn_available() return False in transformers
-# by making "import sklearn" fail before the broken code runs.
+# By patching find_spec, we make Python think these packages don't exist.
+# This is cleaner than blocking imports because:
+# 1. is_sklearn_available() returns False (not True then crash)
+# 2. No import errors - the code just skips sklearn features
 
-class _BlockedModule:
-    """Placeholder that raises ImportError when accessed."""
-    def __init__(self, name):
-        self._name = name
-    def __getattr__(self, attr):
-        raise ImportError(f"Module '{self._name}' is blocked to prevent numpy conflicts")
+_HIDDEN_PACKAGES = frozenset([
+    'sklearn',
+    'tensorflow', 'tf',
+    'keras',
+])
 
-# Block ALL problematic modules that were compiled against numpy 1.x
-BLOCKED_MODULES = [
-    'sklearn', 'sklearn.metrics', 'sklearn.utils', 'sklearn.base',
-    'tensorflow', 'tensorflow.python',
-    'keras', 'keras.api',
-]
+_original_find_spec = importlib.util.find_spec
 
-for blocked in BLOCKED_MODULES:
-    if blocked not in sys.modules:  # Don't overwrite if already loaded
-        sys.modules[blocked] = _BlockedModule(blocked)
+def _patched_find_spec(name, *args, **kwargs):
+    """Return None for broken packages, making them invisible."""
+    # Check if this is a hidden package or submodule
+    base_package = name.split('.')[0]
+    if base_package in _HIDDEN_PACKAGES:
+        return None  # Pretend package doesn't exist
+    return _original_find_spec(name, *args, **kwargs)
 
-print(f"[SETUP] Blocked {len(BLOCKED_MODULES)} modules to prevent numpy conflicts")
+# Apply the patch
+importlib.util.find_spec = _patched_find_spec
+
+print(f"[SETUP] Hidden {len(_HIDDEN_PACKAGES)} broken packages from import system")
 
 # ==========================================================
 # ENVIRONMENT VARIABLES
