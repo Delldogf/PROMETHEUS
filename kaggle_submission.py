@@ -29,45 +29,23 @@ DIAGNOSTICS:
 - Tool call execution is logged
 
 KNOWN ISSUES & FIXES:
-- If you see "ModuleNotFoundError: No module named 'rpds.rpds'" - this is a Kaggle
-  environment bug, not our code. See FIX_RPDS_ERROR below.
-- If you see "numpy.dtype size changed, may indicate binary incompatibility" - 
-  this is a numpy/sklearn version mismatch. See FIX_NUMPY_ERROR below.
+
+1. "ModuleNotFoundError: No module named 'rpds.rpds'" 
+   → Kaggle environment bug. Try creating a fresh notebook.
+
+2. "numpy.dtype size changed, may indicate binary incompatibility"
+   → This is FIXED by setting TRANSFORMERS_NO_TF=1 before imports.
+   → The error happens because: vllm → transformers → tensorflow → sklearn → numpy
+   → By skipping tensorflow, we avoid the sklearn import entirely.
+
+3. For best results, FORK A WORKING NOTEBOOK like:
+   - "AIMO 3 | GPT-OSS-120B (with tools)" by Andreas Bisiadis
+   - This has the correct package versions and wheel files pre-attached.
+
+REQUIRED KAGGLE DATASETS:
+- GPT-OSS-120B model: /kaggle/input/gpt-oss-120b/transformers/default/1
+- (Optional) Wheels dataset for vLLM: /kaggle/input/aimo-3-utils/wheels.tar.gz
 """
-
-# ============================================================
-# FIX 1: KAGGLE ENVIRONMENT BUG (rpds.rpds error)
-# ============================================================
-# If you encounter "ModuleNotFoundError: No module named 'rpds.rpds'", 
-# this is a bug in Kaggle's aimoutility environment, not our code.
-#
-# WORKAROUND OPTIONS:
-# 1. Create a fresh notebook and paste this code (sometimes fixes it)
-# 2. Add this as the FIRST CELL of your notebook (with internet enabled):
-#    !pip install --force-reinstall rpds-py referencing jsonschema
-# 3. If that doesn't work, the issue is in Kaggle's papermill/nbconvert pipeline
-#    and you may need to report it to Kaggle or wait for them to fix it.
-#
-# The error happens BEFORE your Python code runs (during notebook conversion),
-# so if you see this error, the notebook isn't even starting your code yet.
-# ============================================================
-
-# ============================================================
-# FIX 2: NUMPY/SKLEARN BINARY INCOMPATIBILITY
-# ============================================================
-# If you encounter "numpy.dtype size changed, may indicate binary incompatibility",
-# this means sklearn was compiled with a different numpy version.
-#
-# WORKAROUND - Add this as the FIRST CELL of your notebook:
-#
-#   !pip install --quiet --force-reinstall numpy==1.26.4
-#   !pip install --quiet --force-reinstall scikit-learn
-#
-# Then RESTART the notebook kernel and run again.
-#
-# This error happens because Kaggle's pre-installed packages are sometimes
-# compiled against different versions of numpy.
-# ============================================================
 
 import os
 import re
@@ -227,58 +205,101 @@ LOGGER = DiagnosticLogger(verbose=True)
 
 
 # ============================================================
-# KAGGLE ENVIRONMENT FIXES
+# CRITICAL: ENVIRONMENT VARIABLES (SET BEFORE ANY IMPORTS!)
+# ============================================================
+# These MUST be set before importing transformers, vllm, etc.
+# They prevent the cascade: vllm -> transformers -> tensorflow -> keras -> sklearn -> numpy error
+
+os.environ['TRANSFORMERS_NO_TF'] = '1'           # Skip TensorFlow imports
+os.environ['TRANSFORMERS_NO_FLAX'] = '1'         # Skip Flax imports  
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'         # Suppress TF logging
+os.environ['TOKENIZERS_PARALLELISM'] = 'false'   # Avoid tokenizer warnings
+os.environ['CUDA_VISIBLE_DEVICES'] = '0'         # Use first GPU
+
+# ============================================================
+# KAGGLE ENVIRONMENT SETUP
 # ============================================================
 
-# Fix for numpy/sklearn binary incompatibility in Kaggle
-# This error: "numpy.dtype size changed, may indicate binary incompatibility"
-# happens when sklearn was compiled with a different numpy version
-try:
-    import subprocess
-    import sys
+import subprocess
+import sys
+
+def setup_kaggle_environment():
+    """
+    Set up the Kaggle environment with required packages.
     
-    # Check if we're in a Kaggle environment
-    if os.path.exists('/kaggle'):
-        LOGGER.log("Kaggle environment detected - checking package compatibility", "INFO")
-        
-        # Try to fix numpy/sklearn compatibility if needed
-        # This might help with the binary incompatibility error
-        # Uncomment the lines below if you get numpy.dtype errors:
-        # subprocess.run([sys.executable, "-m", "pip", "install", "--quiet", 
-        #                 "--force-reinstall", "numpy==1.26.4"], check=False)
-        # subprocess.run([sys.executable, "-m", "pip", "install", "--quiet",
-        #                 "--force-reinstall", "scikit-learn"], check=False)
-except Exception as e:
-    LOGGER.log(f"Environment fix check failed (non-critical): {e}", "WARN")
+    IMPORTANT: You need to attach a dataset with pre-built wheel files.
+    The working notebooks use '/kaggle/input/aimo-3-utils/wheels.tar.gz'
+    or similar datasets with vLLM wheels.
+    
+    If you don't have this, you can:
+    1. Fork a working notebook like 'AIMO 3 | GPT-OSS-120B (with tools)'
+    2. Or create your own wheels dataset
+    """
+    wheels_archives = [
+        '/kaggle/input/aimo-3-utils/wheels.tar.gz',  # Common utils dataset
+        '/kaggle/input/vllm-whl/wheels.tar.gz',       # Alternative
+    ]
+    
+    temp_dir = '/kaggle/tmp/setup'
+    
+    for archive in wheels_archives:
+        if os.path.exists(archive):
+            LOGGER.log(f"Found wheels archive: {archive}", "INFO")
+            try:
+                os.makedirs(temp_dir, exist_ok=True)
+                subprocess.run(['tar', '-xzf', archive, '-C', temp_dir], check=True)
+                
+                # Install vLLM from local wheels
+                subprocess.run([
+                    sys.executable, '-m', 'pip', 'install', 
+                    '--no-index', '--find-links', f'{temp_dir}/wheels',
+                    '--quiet', 'vllm'
+                ], check=True)
+                
+                LOGGER.log("Installed vLLM from local wheels", "INFO")
+                return True
+            except Exception as e:
+                LOGGER.log(f"Failed to install from {archive}: {e}", "WARN")
+    
+    LOGGER.log("No wheels archive found - using pre-installed packages", "INFO")
+    return False
+
+# Only run setup in Kaggle
+if os.path.exists('/kaggle'):
+    setup_kaggle_environment()
 
 # ============================================================
-# VLLM STABILITY SETTINGS FOR GPT-OSS
+# IMPORT VLLM OR FALLBACK
 # ============================================================
 
-# Set V1 engine off for GPT-OSS stability (if experiencing issues)
-# Uncomment the line below if you experience hangs or garbled output
-# os.environ["VLLM_USE_V1"] = "0"
-
-# Disable tensorflow logging before imports (reduces noise)
-os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
-
-# Try vLLM first (preferred for tool calling), fallback to Transformers
 USE_VLLM = False
+USE_VLLM_SERVER = False  # Use vLLM as OpenAI-compatible server (recommended)
+
 try:
     from vllm import LLM
     from vllm.sampling_params import SamplingParams
     USE_VLLM = True
-    LOGGER.log("vLLM imported successfully", "INFO")
+    LOGGER.log("vLLM imported successfully (direct mode)", "INFO")
 except (ImportError, ValueError, OSError) as e:
     USE_VLLM = False
-    LOGGER.log(f"vLLM not available: {type(e).__name__}: {e}", "WARN")
-    LOGGER.log("Falling back to Transformers", "WARN")
+    LOGGER.log(f"vLLM direct import failed: {type(e).__name__}: {e}", "WARN")
+    LOGGER.log("Will try vLLM server mode or Transformers fallback", "INFO")
 
-# If vLLM failed, try Transformers
+# If direct vLLM failed, try using it as a server (like the working notebooks do)
 if not USE_VLLM:
     try:
+        # Check if we can use vLLM as an OpenAI-compatible server
+        from openai import OpenAI
+        USE_VLLM_SERVER = True
+        LOGGER.log("OpenAI client available - can use vLLM server mode", "INFO")
+    except ImportError:
+        pass
+
+# Final fallback to Transformers
+if not USE_VLLM and not USE_VLLM_SERVER:
+    try:
         from transformers import AutoModelForCausalLM, AutoTokenizer
-        LOGGER.log("Transformers imported successfully", "INFO")
+        LOGGER.log("Using Transformers as fallback", "INFO")
     except (ImportError, ValueError, OSError) as e2:
         LOGGER.log(f"Transformers also not available: {type(e2).__name__}: {e2}", "ERROR")
 
